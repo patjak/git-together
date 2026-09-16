@@ -100,8 +100,8 @@ def get_commit_list(repo_path: str, rev_spec: str) -> list[str]:
         return []
 
 
-def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str]]:
-    """Worker function: Computes patch IDs for a chunk of SHAs on a single CPU core."""
+def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, str]]:
+    """Worker function: Computes patch IDs and subjects for a chunk of SHAs on a single CPU core."""
     repo_path, shas = args
     input_shas = "\n".join(shas) + "\n"
 
@@ -142,17 +142,58 @@ def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str]]
     except BrokenPipeError:
         pass
 
-    results = []
+    raw_patch_results = []
     for line in patch_proc.stdout:
         parts = line.strip().split()
         if len(parts) == 2:
             patch_id, sha = parts[0], parts[1].lower()
             if len(sha) == 40:
-                results.append((patch_id, sha))
+                raw_patch_results.append((patch_id, sha))
 
     patch_proc.stdout.close()
     patch_proc.wait()
     log_proc.wait()
+
+    # Retrieve subject lines for each commit in the chunk
+    sha_to_subject = {}
+    subject_cmd = [
+        "git",
+        "--no-pager",
+        "log",
+        "--no-walk",
+        "--stdin",
+        "--format=%H %s",
+    ]
+    subj_proc = subprocess.Popen(
+        subject_cmd,
+        cwd=repo_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        bufsize=1024 * 1024,
+    )
+    try:
+        subj_proc.stdin.write(input_shas)
+        subj_proc.stdin.close()
+    except BrokenPipeError:
+        pass
+
+    for line in subj_proc.stdout:
+        line = line.rstrip("\r\n")
+        if len(line) >= 40:
+            sha = line[:40].lower()
+            subject = line[41:].strip() if len(line) > 40 else ""
+            sha_to_subject[sha] = subject
+
+    subj_proc.stdout.close()
+    subj_proc.wait()
+
+    results = []
+    for patch_id, sha in raw_patch_results:
+        subject = sha_to_subject.get(sha, "")
+        results.append((patch_id, subject, sha))
+
     return results
 
 
@@ -277,12 +318,12 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     )
     sys.stdout.flush()
 
-    # 3. Parallel patch-ID computation
+    # 3. Parallel patch-ID and subject computation
     existing_db_shas = list(existing_sha_to_gid.keys())
     shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
 
     print(
-        f"Calculating patch IDs for {len(shas_to_scan):,} total commits across {num_workers} workers..."
+        f"Calculating patch IDs and subjects for {len(shas_to_scan):,} total commits across {num_workers} workers..."
     )
     chunks = [
         (repo_path, shas_to_scan[i : i + CHUNK_SIZE])
@@ -295,8 +336,8 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         for chunk_results in pool.imap_unordered(process_patch_id_chunk, chunks):
-            for patch_id, sha in chunk_results:
-                patch_to_shas[patch_id].append(sha)
+            for patch_id, subject, sha in chunk_results:
+                patch_to_shas[(patch_id, subject)].append(sha)
                 processed_patches += 1
 
             pct = min((processed_patches / total_scan_count) * 100, 100.0)
@@ -310,9 +351,9 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     )
     sys.stdout.flush()
 
-    # Group commits sharing identical patch-ids
-    print("Grouping identical patches...")
-    for patch_id, shas in patch_to_shas.items():
+    # Group commits sharing identical patch-ids and commit subjects
+    print("Grouping identical patches with matching subjects...")
+    for (patch_id, subject), shas in patch_to_shas.items():
         if len(shas) > 1:
             first_sha = shas[0]
             for other_sha in shas[1:]:
