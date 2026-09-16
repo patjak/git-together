@@ -198,18 +198,23 @@ def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, 
 
 
 def stream_commit_messages(repo_path: str, rev_spec: str):
-    """Streams commit hashes and message bodies using NUL-byte delimiters."""
+    """Streams commit hashes and message bodies using binary-safe NUL (-z) delimiters."""
     cmd = [
         "git",
         "--no-pager",
         "log",
+        "-z",
         "--reverse",
         "--no-abbrev-commit",
-        "--format=%H%n%B%x00",
+        "--format=%H%n%B",
         rev_spec,
     ]
     proc = subprocess.Popen(
-        cmd, cwd=repo_path, stdout=subprocess.PIPE, bufsize=1024 * 1024
+        cmd,
+        cwd=repo_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1024 * 1024,
     )
 
     buffer = bytearray()
@@ -230,7 +235,12 @@ def stream_commit_messages(repo_path: str, rev_spec: str):
                     yield sha, body
 
     proc.stdout.close()
+    stderr_err = proc.stderr.read().decode("utf-8", errors="replace")
+    proc.stderr.close()
     proc.wait()
+
+    if proc.returncode != 0 and stderr_err.strip():
+        print(f"\nWarning: git log process returned error:\n{stderr_err.strip()}", file=sys.stderr)
 
 
 def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
