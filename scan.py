@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import defaultdict
+from typing import List, Optional, Tuple
 
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
@@ -44,9 +45,15 @@ class DisjointSet:
             self.parent[root1] = root2
 
 
-def run_git(cmd: list[str], cwd: str = ".") -> str:
+def run_git(cmd: List[str], cwd: str = ".") -> str:
     res = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, errors="replace", check=True
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        errors="replace",
+        check=True,
     )
     return res.stdout.strip()
 
@@ -68,7 +75,7 @@ def init_db(conn: sqlite3.Connection):
         """)
 
 
-def get_last_processed_commit(conn: sqlite3.Connection, repo_path: str) -> str | None:
+def get_last_processed_commit(conn: sqlite3.Connection, repo_path: str) -> Optional[str]:
     cur = conn.cursor()
     cur.execute("SELECT value FROM state WHERE key = 'last_commit'")
     row = cur.fetchone()
@@ -90,7 +97,7 @@ def get_last_processed_commit(conn: sqlite3.Connection, repo_path: str) -> str |
         return None
 
 
-def get_commit_list(repo_path: str, rev_spec: str) -> list[str]:
+def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
     """Returns an ordered list of full 40-character commit SHAs."""
     try:
         out = run_git(
@@ -102,7 +109,7 @@ def get_commit_list(repo_path: str, rev_spec: str) -> list[str]:
         return []
 
 
-def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, str]]:
+def process_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[str, str, str]]:
     """Worker function: Computes patch IDs and subjects for a chunk of SHAs on a single CPU core."""
     repo_path, shas = args
     input_shas = "\n".join(shas) + "\n"
@@ -123,7 +130,7 @@ def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, 
         cwd=repo_path,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        text=True,
+        universal_newlines=True,
         errors="replace",
         bufsize=1024 * 1024,
     )
@@ -133,7 +140,7 @@ def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, 
         patch_cmd,
         stdin=log_proc.stdout,
         stdout=subprocess.PIPE,
-        text=True,
+        universal_newlines=True,
         errors="replace",
         bufsize=1024 * 1024,
     )
@@ -173,7 +180,7 @@ def process_patch_id_chunk(args: tuple[str, list[str]]) -> list[tuple[str, str, 
         cwd=repo_path,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        text=True,
+        universal_newlines=True,
         errors="replace",
         bufsize=1024 * 1024,
     )
@@ -473,4 +480,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     process_repository(args.repo_path, args.db, args.jobs)
-
