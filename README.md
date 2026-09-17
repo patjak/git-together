@@ -4,7 +4,7 @@ This repository contains a suite of tools designed to scan Git repositories, ide
 
 ## Quick Start & Usage Examples
 
-### Step 1: Scan a Repository
+### Scan a Repository
 Initialize the database by scanning a local Git repository.
 
 ```bash
@@ -15,7 +15,7 @@ python3 scan.py /path/to/my/linux/repo
 python3 scan.py /path/to/my/linux/repo --db custom.db -j 8
 ```
 
-### Step 2: Query the Database
+### Query the Database
 Look up related commits or view database statistics.
 
 ```bash
@@ -29,7 +29,15 @@ python3 lookup.py e4e9b9248ff
 python3 lookup.py 1042
 ```
 
-### Step 3: Verify Patch Files
+### Compare two SHAs
+Compare two user specified SHAs and returns 0 on match and 1 on mismatch
+
+```bash
+# Compare SHAs
+python3 lookup.py 0890d74f295 b6651129cc2
+```
+
+### Verify Patch Files
 Ensure your SUSE patches are compliant and their alt commits match known groups.
 
 ```bash
@@ -40,7 +48,7 @@ python3 verify_patches.py /path/to/patches
 python3 verify_patches.py /path/to/patches --recursive --db custom.db
 ```
 
-### Step 4: Run Tests
+### Run Tests
 Run unit tests.
 
 ```bash
