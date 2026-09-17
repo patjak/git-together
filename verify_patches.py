@@ -6,6 +6,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Dict, List, Set, Tuple
 
 DB_NAME = "git-together.db"
 
@@ -19,7 +20,7 @@ ALT_COMMIT_RE = re.compile(
 )
 
 
-def extract_commit_hashes(file_path: Path) -> tuple[list[str], list[str]]:
+def extract_commit_hashes(file_path: Path) -> Tuple[List[str], List[str]]:
     """Extracts Git-commit and Alt-commit hashes from a patch file."""
     try:
         content = file_path.read_text(encoding="utf-8", errors="replace")
@@ -32,8 +33,8 @@ def extract_commit_hashes(file_path: Path) -> tuple[list[str], list[str]]:
 
 
 def batch_get_sha_groups(
-    conn: sqlite3.Connection, shas: set[str]
-) -> dict[str, int]:
+    conn: sqlite3.Connection, shas: Set[str]
+) -> Dict[str, int]:
     """Queries SQLite for a set of SHAs and returns a mapping of SHA -> group_id."""
     if not shas:
         return {}
@@ -143,7 +144,10 @@ def verify_patch_directory(dir_path: Path, db_path: str, recursive: bool):
         print("NON-COMPLIANT PATCH FILES:")
         print("-" * 50)
         for pf, reason in non_compliant_files:
-            rel_path = pf.relative_to(dir_path) if pf.is_relative_to(dir_path) else pf
+            try:
+                rel_path = pf.relative_to(dir_path)
+            except ValueError:
+                rel_path = pf
             print(f"  [FAIL] {rel_path}")
             print(f"         Reason: {reason}")
         print("-" * 50)
