@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from cherry_picker import (
+from scan import (
     CHERRY_PICK_RE,
     DisjointSet,
     get_commit_list,
