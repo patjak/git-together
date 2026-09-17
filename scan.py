@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections import defaultdict
 
-DB_NAME = "git_hashes.db"
+DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
 

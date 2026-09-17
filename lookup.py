@@ -5,7 +5,7 @@ import os
 import sqlite3
 import sys
 
-DB_NAME = "git_hashes.db"
+DB_NAME = "git-together.db"
 
 EXAMPLES_TEXT = """examples:
   python3 hash_lookup.py e4e9b9248ff       # Lookup sibling hashes for a commit SHA

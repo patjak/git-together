@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-DB_NAME = "git_hashes.db"
+DB_NAME = "git-together.db"
 
 GIT_COMMIT_RE = re.compile(
     r"^\s*Git-commit:\s*[\[<]?\s*([a-fA-F0-9]{40})\s*[\]>]?",
