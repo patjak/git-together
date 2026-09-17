@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import os
 import shutil
 import sqlite3
@@ -177,3 +179,4 @@ class TestGitIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

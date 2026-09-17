@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import argparse
 import os
 import re
@@ -171,3 +173,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     verify_patch_directory(args.directory, args.db, args.recursive)
+

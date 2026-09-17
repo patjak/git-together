@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import argparse
 import os
 import sqlite3
@@ -216,3 +218,4 @@ if __name__ == "__main__":
     else:
         parser.print_help(sys.stderr)
         sys.exit(1)
+

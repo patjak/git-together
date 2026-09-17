@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import argparse
 import multiprocessing
 import os
@@ -471,3 +473,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     process_repository(args.repo_path, args.db, args.jobs)
+
