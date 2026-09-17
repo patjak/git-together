@@ -8,10 +8,11 @@ import sys
 DB_NAME = "git-together.db"
 
 EXAMPLES_TEXT = """examples:
-  python3 hash_lookup.py e4e9b9248ff       # Lookup sibling hashes for a commit SHA
-  python3 hash_lookup.py 1042              # Lookup all hashes in Group #1042
-  python3 hash_lookup.py stats             # Show database statistics
-  python3 hash_lookup.py --db custom.db 22 # Query against a custom SQLite DB file
+  python3 lookup.py e4e9b9248ff       # Lookup sibling hashes for a commit SHA
+  python3 lookup.py e4e9b9248ff 1042a  # Compare two SHAs (exits with code 0 on match, 1 otherwise)
+  python3 lookup.py 1042              # Lookup all hashes in Group #1042
+  python3 lookup.py stats             # Show database statistics
+  python3 lookup.py --db custom.db 22 # Query against a custom SQLite DB file
 """
 
 
@@ -24,27 +25,8 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} TB"
 
 
-def lookup_group(db_path: str, group_id: int):
-    """Prints all commit hashes belonging to a specific group_id (one per line)."""
-    if not os.path.exists(db_path):
-        sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
-        sys.exit(1)
-
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT hex(hash_value) FROM hashes WHERE group_id = ?", (group_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    for r in rows:
-        sys.stdout.write(f"{r[0].lower()}\n")
-
-
-def lookup_hash(db_path: str, query_hash: str):
-    """Prints all sibling hashes sharing a group with target SHA (excluding target SHA)."""
+def resolve_sha_group(db_path: str, query_hash: str) -> int:
+    """Resolves a full or short SHA to its group_id."""
     if not os.path.exists(db_path):
         sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
         sys.exit(1)
@@ -52,7 +34,7 @@ def lookup_hash(db_path: str, query_hash: str):
     clean_hash = query_hash.strip().lower()
 
     if not all(c in "0123456789abcdef" for c in clean_hash):
-        sys.stderr.write("Error: Input must be a valid hexadecimal commit SHA.\n")
+        sys.stderr.write(f"Error: '{query_hash}' is not a valid hexadecimal commit SHA.\n")
         sys.exit(1)
 
     conn = sqlite3.connect(db_path)
@@ -78,15 +60,62 @@ def lookup_hash(db_path: str, query_hash: str):
             clean_hash = matches[0]
 
     target_blob = bytes.fromhex(clean_hash)
+    cur.execute("SELECT group_id FROM hashes WHERE hash_value = ?", (target_blob,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        sys.stderr.write(f"Error: Commit SHA '{clean_hash}' not found in database.\n")
+        sys.exit(1)
+
+    return row[0]
+
+
+def compare_shas(db_path: str, sha1: str, sha2: str):
+    """Checks if two SHAs belong to the same group and exits with 0 on match or 1 on mismatch."""
+    group1 = resolve_sha_group(db_path, sha1)
+    group2 = resolve_sha_group(db_path, sha2)
+
+    if group1 == group2:
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+
+def lookup_group(db_path: str, group_id: int):
+    """Prints all commit hashes belonging to a specific group_id (one per line)."""
+    if not os.path.exists(db_path):
+        sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
+        sys.exit(1)
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
 
     cur.execute(
+        "SELECT hex(hash_value) FROM hashes WHERE group_id = ?", (group_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    for r in rows:
+        sys.stdout.write(f"{r[0].lower()}\n")
+
+
+def lookup_hash(db_path: str, query_hash: str):
+    """Prints all sibling hashes sharing a group with target SHA (excluding target SHA)."""
+    group_id = resolve_sha_group(db_path, query_hash)
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    clean_hash = query_hash.strip().lower()
+    cur.execute(
         """
-        SELECT hex(sibling.hash_value)
-        FROM hashes target
-        JOIN hashes sibling ON target.group_id = sibling.group_id
-        WHERE target.hash_value = ? AND sibling.hash_value != ?
+        SELECT hex(hash_value)
+        FROM hashes
+        WHERE group_id = ? AND hex(hash_value) NOT LIKE ?
         """,
-        (target_blob, target_blob),
+        (group_id, clean_hash + "%"),
     )
     results = cur.fetchall()
     conn.close()
@@ -191,9 +220,9 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "target",
-        nargs="?",
-        help="Commit SHA, Group ID (e.g. 1042 or g1042), or 'stats'.",
+        "targets",
+        nargs="*",
+        help="Commit SHA(s), Group ID (e.g. 1042 or g1042), or 'stats'. Pass two SHAs to compare.",
     )
     parser.add_argument(
         "--db",
@@ -211,10 +240,13 @@ if __name__ == "__main__":
 
     if args.group is not None:
         lookup_group(args.db, args.group)
-    elif args.target == "stats":
-        show_stats(args.db)
-    elif args.target:
-        smart_lookup(args.db, args.target)
+    elif len(args.targets) == 2:
+        compare_shas(args.db, args.targets[0], args.targets[1])
+    elif len(args.targets) == 1:
+        if args.targets[0] == "stats":
+            show_stats(args.db)
+        else:
+            smart_lookup(args.db, args.targets[0])
     else:
         parser.print_help(sys.stderr)
         sys.exit(1)
