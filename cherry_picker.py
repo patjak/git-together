@@ -272,6 +272,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     print(f"Fetching commit list for range ({rev_spec})...")
     new_commits = get_commit_list(repo_path, rev_spec)
     total_new_commits = len(new_commits)
+    new_commits_set = set(new_commits)
 
     if total_new_commits == 0:
         print("No new commits to process.")
@@ -301,7 +302,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         for other_sha in shas[1:]:
             dsu.union(first_sha, other_sha)
 
-    # 2. Stream and match commit messages with improved live progress
+    # 2. Stream and match commit messages for the new commit range
     print("Scanning commit messages for explicit cherry-pick tags...")
     latest_commit = None
     msg_count = 0
@@ -331,7 +332,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         f"\r\033[K  Message Scan: {msg_count:,}/{total_new_commits:,} commits ({pct:.1f}%)\n"
     )
     sys.stdout.flush()
-    print(f"  -> Detected {tag_match_count:,} commits via explicit 'cherry picked from' tags.")
+    print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
 
     # 3. Parallel patch-ID and subject computation
     existing_db_shas = list(existing_sha_to_gid.keys())
@@ -373,20 +374,24 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     for (patch_id, subject), shas in patch_to_shas.items():
         if len(shas) > 1:
-            patch_group_count += 1
-            patch_commit_count += len(shas)
             first_sha = shas[0]
             for other_sha in shas[1:]:
                 dsu.union(first_sha, other_sha)
 
+            # Count ONLY matches involving new commits scanned in the current run
+            new_in_group = [s for s in shas if s in new_commits_set]
+            if new_in_group:
+                patch_group_count += 1
+                patch_commit_count += len(new_in_group)
+
     print(
-        f"  -> Detected {patch_commit_count:,} commits matching across {patch_group_count:,} patch-id + subject groups."
+        f"  -> Detected {patch_commit_count:,} new commits matching across {patch_group_count:,} patch-id + subject groups."
     )
 
-    print("\n--- Detection Summary ---")
+    print("\n--- Detection Summary (Current Run Only) ---")
     print(f"  Explicit Tags Found   : {tag_match_count:,} commits")
     print(f"  Patch-ID+Subject Match: {patch_commit_count:,} commits ({patch_group_count:,} groups)")
-    print("-------------------------\n")
+    print("--------------------------------------------\n")
 
     # 4. Resolve group IDs and bulk write to SQLite
     print("Writing groups to SQLite...")
