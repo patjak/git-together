@@ -10,7 +10,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Label, OptionList, Static
+from textual.widgets import Footer, Header, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 DETECTION_NAMES = {
@@ -90,6 +90,56 @@ class FilterModal(ModalScreen):
             self.dismiss(int(event.option.id))
 
 
+class SearchModal(ModalScreen):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    SearchModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.6);
+    }
+
+    #search-dialog {
+        width: 50;
+        height: 9;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #search-title {
+        background: $accent;
+        color: $text;
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        padding: 0 1;
+    }
+
+    #search-input {
+        margin: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-dialog"):
+            yield Label("Search Commit Hash", id="search-title")
+            yield Input(placeholder="Enter SHA (full or partial)...", id="search-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#search-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(CANCEL)
+
+    @on(Input.Submitted, "#search-input")
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        val = event.value.strip()
+        if val:
+            self.dismiss(val)
+        else:
+            self.dismiss(CANCEL)
+
+
 class CommitBrowserApp(App):
     CSS = """
     Screen {
@@ -135,6 +185,9 @@ class CommitBrowserApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("f", "filter", "Filter"),
+        ("s", "search", "Search"),
+        ("b", "toggle_blacklist", "Blacklist/Unblacklist"),
+        ("B", "toggle_show_blacklisted", "Show/Hide Blacklist"),
         ("tab", "focus_next", "Focus Next Pane"),
         ("shift+tab", "focus_previous", "Focus Prev Pane"),
     ]
@@ -147,6 +200,9 @@ class CommitBrowserApp(App):
         self.group_ids = []
         self.current_shas = []
         self.selected_detection_type = None
+        self.target_sha_to_select = None
+        self.blacklisted_shas = set()
+        self.show_blacklisted = True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -163,6 +219,26 @@ class CommitBrowserApp(App):
                     yield Static(id="commit-view", expand=True)
         yield Footer()
 
+    def load_blacklist(self) -> None:
+        self.blacklisted_shas = set()
+        if os.path.exists("blacklisted_shas.txt"):
+            try:
+                with open("blacklisted_shas.txt", "r") as f:
+                    for line in f:
+                        sha = line.strip().lower()
+                        if sha:
+                            self.blacklisted_shas.add(sha)
+            except Exception as e:
+                self.notify(f"Failed to load blacklist: {e}", severity="error")
+
+    def save_blacklist(self) -> None:
+        try:
+            with open("blacklisted_shas.txt", "w") as f:
+                for sha in sorted(self.blacklisted_shas):
+                    f.write(f"{sha}\n")
+        except Exception as e:
+            self.notify(f"Failed to save blacklist: {e}", severity="error")
+
     def on_mount(self) -> None:
         if not os.path.exists(self.repo_path):
             self.exit(message=f"Error: Repository path '{self.repo_path}' does not exist.")
@@ -173,7 +249,81 @@ class CommitBrowserApp(App):
             return
 
         self.conn = sqlite3.connect(self.db_path)
+        self.load_blacklist()
+        self.update_group_title()
         self.load_groups()
+
+    def action_toggle_show_blacklisted(self) -> None:
+        self.show_blacklisted = not self.show_blacklisted
+        status = "showing" if self.show_blacklisted else "hiding"
+        self.notify(f"Now {status} blacklisted items", severity="information")
+        self.update_group_title()
+
+        groups_list = self.query_one("#groups-list", OptionList)
+        current_gid = (
+            self.group_ids[groups_list.highlighted]
+            if groups_list.highlighted is not None
+            and 0 <= groups_list.highlighted < len(self.group_ids)
+            else None
+        )
+        self.load_groups(target_gid=current_gid)
+
+    def action_toggle_blacklist(self) -> None:
+        focused = self.focused
+        if not focused or not self.conn:
+            return
+
+        if focused.id == "groups-list":
+            groups_list = self.query_one("#groups-list", OptionList)
+            if (
+                groups_list.highlighted is not None
+                and 0 <= groups_list.highlighted < len(self.group_ids)
+            ):
+                gid = self.group_ids[groups_list.highlighted]
+                cur = self.conn.cursor()
+                cur.execute(
+                    "SELECT lower(hex(hash_value)) FROM hashes WHERE group_id = ?",
+                    (gid,),
+                )
+                shas_in_group = [r[0] for r in cur.fetchall()]
+
+                all_blacklisted = all(sha in self.blacklisted_shas for sha in shas_in_group)
+                if all_blacklisted:
+                    self.blacklisted_shas.difference_update(shas_in_group)
+                    self.notify(f"Unblacklisted Group #{gid}", severity="information")
+                else:
+                    self.blacklisted_shas.update(shas_in_group)
+                    self.notify(f"Blacklisted Group #{gid}", severity="information")
+
+                self.save_blacklist()
+                self.load_groups(target_gid=gid)
+
+        elif focused.id == "shas-list":
+            shas_list = self.query_one("#shas-list", OptionList)
+            if (
+                shas_list.highlighted is not None
+                and 0 <= shas_list.highlighted < len(self.current_shas)
+            ):
+                sha = self.current_shas[shas_list.highlighted]
+                if sha in self.blacklisted_shas:
+                    self.blacklisted_shas.remove(sha)
+                    self.notify(f"Unblacklisted SHA {sha[:10]}", severity="information")
+                else:
+                    self.blacklisted_shas.add(sha)
+                    self.notify(f"Blacklisted SHA {sha[:10]}", severity="information")
+
+                self.save_blacklist()
+
+                groups_list = self.query_one("#groups-list", OptionList)
+                current_gid = (
+                    self.group_ids[groups_list.highlighted]
+                    if groups_list.highlighted is not None
+                    and 0 <= groups_list.highlighted < len(self.group_ids)
+                    else None
+                )
+                self.target_sha_to_select = sha
+                self.load_groups(target_gid=current_gid)
+                self.query_one("#shas-list", OptionList).focus()
 
     def action_filter(self) -> None:
         def apply_filter(result):
@@ -185,38 +335,83 @@ class CommitBrowserApp(App):
 
         self.push_screen(FilterModal(self.selected_detection_type), apply_filter)
 
+    def action_search(self) -> None:
+        def perform_search(sha_query):
+            if sha_query is CANCEL or not sha_query or not self.conn:
+                return
+
+            where_conditions = ["lower(hex(hash_value)) LIKE ?"]
+            params = [f"{sha_query.lower()}%"]
+
+            if not self.show_blacklisted and self.blacklisted_shas:
+                placeholders = ",".join("?" for _ in self.blacklisted_shas)
+                where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
+                params.extend(list(self.blacklisted_shas))
+
+            where_clause = " WHERE " + " AND ".join(where_conditions)
+
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT group_id, lower(hex(hash_value)) FROM hashes {where_clause}",
+                params,
+            )
+            match = cur.fetchone()
+
+            if not match:
+                self.notify(f"No matching SHA '{sha_query}' found.", severity="warning")
+                return
+
+            target_gid, target_sha = match
+
+            self.selected_detection_type = None
+            self.update_group_title()
+
+            self.target_sha_to_select = target_sha
+            self.load_groups(target_gid=target_gid)
+
+            self.query_one("#shas-list", OptionList).focus()
+
+        self.push_screen(SearchModal(), perform_search)
+
     def update_group_title(self) -> None:
         title_label = self.query_one("#groups-title", Label)
-        if self.selected_detection_type is None:
-            title_label.update("Group Section (All)")
-        else:
-            dt_name = DETECTION_NAMES.get(self.selected_detection_type, "Filtered")
-            title_label.update(f"Group Section [{dt_name}]")
+        dt_str = (
+            "All"
+            if self.selected_detection_type is None
+            else DETECTION_NAMES.get(self.selected_detection_type, "Filtered")
+        )
+        blk_str = " [Show Blacklist]" if self.show_blacklisted else ""
+        title_label.update(f"Group Section ({dt_str}){blk_str}")
 
-    def load_groups(self) -> None:
+    def load_groups(self, target_gid: int | None = None) -> None:
         if not self.conn:
             return
-        cur = self.conn.cursor()
+
+        where_conditions = []
+        params = []
+
         if self.selected_detection_type is not None:
-            cur.execute(
-                """
-                SELECT group_id, COUNT(*) as cnt 
-                FROM hashes 
-                WHERE detection_type = ?
-                GROUP BY group_id 
-                ORDER BY cnt DESC, group_id ASC
-            """,
-                (self.selected_detection_type,),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT group_id, COUNT(*) as cnt 
-                FROM hashes 
-                GROUP BY group_id 
-                ORDER BY cnt DESC, group_id ASC
-            """
-            )
+            where_conditions.append("detection_type = ?")
+            params.append(self.selected_detection_type)
+
+        if not self.show_blacklisted and self.blacklisted_shas:
+            placeholders = ",".join("?" for _ in self.blacklisted_shas)
+            where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
+            params.extend(list(self.blacklisted_shas))
+
+        where_clause = " WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+
+        cur = self.conn.cursor()
+        cur.execute(
+            f"""
+            SELECT group_id, COUNT(*) as cnt 
+            FROM hashes 
+            {where_clause}
+            GROUP BY group_id 
+            ORDER BY cnt DESC, group_id ASC
+        """,
+            params,
+        )
         rows = cur.fetchall()
 
         groups_list = self.query_one("#groups-list", OptionList)
@@ -225,13 +420,34 @@ class CommitBrowserApp(App):
 
         for gid, count in rows:
             self.group_ids.append(gid)
-            groups_list.add_option(
-                Option(f"Group #{gid} ({count} members)", id=str(gid))
-            )
+
+            if self.show_blacklisted and self.blacklisted_shas:
+                cur.execute(
+                    "SELECT lower(hex(hash_value)) FROM hashes WHERE group_id = ?",
+                    (gid,),
+                )
+                g_shas = [r[0] for r in cur.fetchall()]
+                blk_count = sum(1 for s in g_shas if s in self.blacklisted_shas)
+
+                if blk_count == len(g_shas) and len(g_shas) > 0:
+                    label = f"[strike]Group #{gid} ({count} members)[/strike] [BLACKLISTED]"
+                elif blk_count > 0:
+                    label = f"Group #{gid} ({count} members) [{blk_count} BLK]"
+                else:
+                    label = f"Group #{gid} ({count} members)"
+            else:
+                label = f"Group #{gid} ({count} members)"
+
+            groups_list.add_option(Option(label, id=str(gid)))
 
         if self.group_ids:
-            groups_list.highlighted = 0
-            self.load_shas_for_group(self.group_ids[0])
+            gid_idx = (
+                self.group_ids.index(target_gid)
+                if target_gid is not None and target_gid in self.group_ids
+                else 0
+            )
+            groups_list.highlighted = gid_idx
+            self.load_shas_for_group(self.group_ids[gid_idx])
         else:
             self.current_shas = []
             shas_list = self.query_one("#shas-list", OptionList)
@@ -240,24 +456,29 @@ class CommitBrowserApp(App):
 
     def load_shas_for_group(self, group_id: int) -> None:
         cur = self.conn.cursor()
+
+        where_conditions = ["group_id = ?"]
+        params = [group_id]
+
         if self.selected_detection_type is not None:
-            cur.execute(
-                """
-                SELECT lower(hex(hash_value)), detection_type, similarity 
-                FROM hashes 
-                WHERE group_id = ? AND detection_type = ?
-            """,
-                (group_id, self.selected_detection_type),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT lower(hex(hash_value)), detection_type, similarity 
-                FROM hashes 
-                WHERE group_id = ?
-            """,
-                (group_id,),
-            )
+            where_conditions.append("detection_type = ?")
+            params.append(self.selected_detection_type)
+
+        if not self.show_blacklisted and self.blacklisted_shas:
+            placeholders = ",".join("?" for _ in self.blacklisted_shas)
+            where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
+            params.extend(list(self.blacklisted_shas))
+
+        where_clause = " WHERE " + " AND ".join(where_conditions)
+
+        cur.execute(
+            f"""
+            SELECT lower(hex(hash_value)), detection_type, similarity 
+            FROM hashes 
+            {where_clause}
+        """,
+            params,
+        )
         rows = cur.fetchall()
 
         shas_list = self.query_one("#shas-list", OptionList)
@@ -268,11 +489,25 @@ class CommitBrowserApp(App):
             self.current_shas.append(sha)
             dt_str = DETECTION_NAMES.get(dt, str(dt))
             sim_str = f" | {sim:.2f}" if sim is not None else ""
-            shas_list.add_option(Option(f"{sha[:10]} [{dt_str}{sim_str}]", id=sha))
+
+            if sha in self.blacklisted_shas:
+                label = f"[strike]{sha[:10]}[/strike] [{dt_str}{sim_str}] [BLACKLISTED]"
+            else:
+                label = f"{sha[:10]} [{dt_str}{sim_str}]"
+
+            shas_list.add_option(Option(label, id=sha))
 
         if self.current_shas:
-            shas_list.highlighted = 0
-            self.show_commit(self.current_shas[0])
+            highlight_idx = 0
+            if (
+                self.target_sha_to_select
+                and self.target_sha_to_select in self.current_shas
+            ):
+                highlight_idx = self.current_shas.index(self.target_sha_to_select)
+                self.target_sha_to_select = None
+
+            shas_list.highlighted = highlight_idx
+            self.show_commit(self.current_shas[highlight_idx])
         else:
             self.query_one("#commit-view", Static).update("")
 
