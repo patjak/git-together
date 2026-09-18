@@ -8,8 +8,9 @@ import sqlite3
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from rapidfuzz import fuzz
@@ -42,6 +43,19 @@ class DetectionType(IntEnum):
     SUBJECT_FUZZY_BODY = 3
     PATCH_ID_SUBJECT = 4  # Fallback tier for rewritten bodies
     SUBJECT_AUTHOR_DATE = 5  # High-confidence subject + author timestamp match
+
+
+@dataclass(slots=True)
+class CommitInfo:
+    """Strongly-typed metadata container for commit comparisons."""
+
+    sha: str
+    author_name: str
+    author_date: int
+    committer_date: int
+    subject: str
+    body: str
+    cleaned_body: str
 
 
 def strip_trailers_and_normalize(body: str) -> str:
@@ -163,7 +177,7 @@ def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
         return []
 
 
-def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
+def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> Dict[str, CommitInfo]:
     """Worker function: Stream author, dates, subject and body metadata for a chunk of SHAs."""
     repo_path, shas = args
     input_shas = "\n".join(shas) + "\n"
@@ -219,13 +233,15 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
                     subject = parts[4].strip()
                     body = parts[5] if len(parts) > 5 else ""
                     cleaned_body = strip_trailers_and_normalize(body)
-                    sha_to_info[sha] = (
-                        author_name,
-                        author_date,
-                        committer_date,
-                        subject,
-                        body,
-                        cleaned_body,
+
+                    sha_to_info[sha] = CommitInfo(
+                        sha=sha,
+                        author_name=author_name,
+                        author_date=author_date,
+                        committer_date=committer_date,
+                        subject=subject,
+                        body=body,
+                        cleaned_body=cleaned_body,
                     )
 
     proc.stdout.close()
@@ -234,65 +250,65 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
 
 
 def process_subject_bucket_chunk(
-    chunk_buckets: List[List[Tuple[str, str, int, int, str]]]
+    chunk_buckets: List[List[CommitInfo]],
 ) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str, float]]]:
     author_date_matches = []
     clean_matches = []
     fuzzy_matches = []
 
-    for sha_tuples in chunk_buckets:
-        n = len(sha_tuples)
+    for commits in chunk_buckets:
+        n = len(commits)
         matched_in_bucket = set()
 
         # 1. Author Date & Clean Body verification within 75-day window
         for i in range(n):
-            sha1, an1, ad1, cd1, cb1 = sha_tuples[i]
+            c1 = commits[i]
             for j in range(i + 1, n):
-                sha2, an2, ad2, cd2, cb2 = sha_tuples[j]
+                c2 = commits[j]
 
-                time_diff = abs(ad1 - ad2) if (ad1 and ad2) else float("inf")
+                time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
 
                 # Reject any candidate pair beyond 1 kernel version cycle on master branch
                 if time_diff > MAX_MAINLINE_CYCLE_GAP:
                     continue
 
-                is_author_date_match = ad1 > 0 and ad1 == ad2
-                is_clean_body_match = cb1 and cb2 and cb1 == cb2
+                is_author_date_match = c1.author_date > 0 and c1.author_date == c2.author_date
+                is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
 
                 if is_author_date_match:
-                    author_date_matches.append((sha1, sha2))
-                    matched_in_bucket.add(sha1)
-                    matched_in_bucket.add(sha2)
+                    author_date_matches.append((c1.sha, c2.sha))
+                    matched_in_bucket.add(c1.sha)
+                    matched_in_bucket.add(c2.sha)
                 elif is_clean_body_match:
-                    clean_matches.append((sha1, sha2))
-                    matched_in_bucket.add(sha1)
-                    matched_in_bucket.add(sha2)
+                    clean_matches.append((c1.sha, c2.sha))
+                    matched_in_bucket.add(c1.sha)
+                    matched_in_bucket.add(c2.sha)
 
         # 2. Fuzzy Body matching for remaining unmatched items in 75-day window
         unmatched = [
-            t for t in sha_tuples if t[0] not in matched_in_bucket and t[4]
+            c for c in commits if c.sha not in matched_in_bucket and c.cleaned_body
         ]
 
         if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
             for i in range(len(unmatched)):
-                sha1, an1, ad1, cd1, cb1 = unmatched[i]
+                c1 = unmatched[i]
                 for j in range(i + 1, len(unmatched)):
-                    sha2, an2, ad2, cd2, cb2 = unmatched[j]
+                    c2 = unmatched[j]
 
-                    time_diff = abs(ad1 - ad2) if (ad1 and ad2) else float("inf")
+                    time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
                     if time_diff > MAX_MAINLINE_CYCLE_GAP:
                         continue
 
-                    len1, len2 = len(cb1), len(cb2)
+                    len1, len2 = len(c1.cleaned_body), len(c2.cleaned_body)
                     if min(len1, len2) / max(len1, len2) < 0.70:
                         continue
 
-                    sim = compute_similarity(cb1, cb2)
-                    authors_same = an1.lower() == an2.lower()
+                    sim = compute_similarity(c1.cleaned_body, c2.cleaned_body)
+                    authors_same = c1.author_name.lower() == c2.author_name.lower()
                     required_sim = 0.85 if authors_same else 0.90
 
                     if sim >= required_sim:
-                        fuzzy_matches.append((sha1, sha2, sim))
+                        fuzzy_matches.append((c1.sha, c2.sha, sim))
 
     return len(chunk_buckets), author_date_matches, clean_matches, fuzzy_matches
 
@@ -416,7 +432,7 @@ def run_metadata_pass(
     sha_detection: defaultdict,
     sha_similarity: defaultdict,
     num_workers: int,
-) -> Tuple[dict, dict, int]:
+) -> Tuple[Dict[str, str], Dict[str, CommitInfo], int]:
     """Extract metadata for SHAs and identify explicit cherry-pick tag relationships."""
     print(f"Fetching metadata for {len(shas_to_scan):,} commits...")
     chunks = [
@@ -425,17 +441,17 @@ def run_metadata_pass(
     ]
 
     sha_to_subject = {}
-    sha_to_meta = {}
+    sha_to_meta: Dict[str, CommitInfo] = {}
     tag_match_count = 0
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         for chunk_info in pool.imap_unordered(fetch_commit_metadata_chunk, chunks):
-            for sha, (an, ad, cd, subj, body, cb) in chunk_info.items():
-                sha_to_subject[sha] = subj
-                sha_to_meta[sha] = (an, ad, cd, cb)
+            for sha, info in chunk_info.items():
+                sha_to_subject[sha] = info.subject
+                sha_to_meta[sha] = info
                 dsu.find(sha)
 
-                match = CHERRY_PICK_RE.search(body)
+                match = CHERRY_PICK_RE.search(info.body)
                 if match:
                     original_sha = match.group(1).lower()
                     if len(original_sha) == 40:
@@ -452,8 +468,8 @@ def run_metadata_pass(
 
 
 def run_subject_bucket_pass(
-    sha_to_subject: dict,
-    sha_to_meta: dict,
+    sha_to_subject: Dict[str, str],
+    sha_to_meta: Dict[str, CommitInfo],
     new_commits_set: Set[str],
     dsu: DisjointSet,
     sha_detection: defaultdict,
@@ -467,11 +483,7 @@ def run_subject_bucket_pass(
             subject_to_shas[subj].append(sha)
 
     candidate_buckets = [
-        [
-            (s, sha_to_meta[s][0], sha_to_meta[s][1], sha_to_meta[s][2], sha_to_meta[s][3])
-            for s in shas
-            if s in sha_to_meta
-        ]
+        [sha_to_meta[s] for s in shas if s in sha_to_meta]
         for shas in subject_to_shas.values()
         if len(shas) >= 2
     ]
@@ -561,7 +573,7 @@ def run_subject_bucket_pass(
 def run_patch_id_fallback_pass(
     repo_path: str,
     subject_to_shas: dict,
-    sha_to_subject: dict,
+    sha_to_subject: Dict[str, str],
     new_commits_set: Set[str],
     dsu: DisjointSet,
     sha_detection: defaultdict,
