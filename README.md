@@ -42,10 +42,10 @@ Ensure your SUSE patches are compliant and their alt commits match known groups.
 
 ```bash
 # Scan a directory of patches
-python3 verify_patches.py /path/to/patches
+python3 verify_patches.py /path/to/kernel-source/patches.suse
 
 # Scan recursively with a custom database
-python3 verify_patches.py /path/to/patches --recursive --db custom.db
+python3 verify_patches.py /path/to/kernel-source/patches.suse --recursive --db custom.db
 ```
 
 ### Run Tests
