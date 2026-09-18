@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 import argparse
 import multiprocessing
@@ -85,6 +85,13 @@ def strip_trailers_and_normalize(body: str) -> str:
 
     cleaned_lines = lines[: idx + 1]
     return " ".join(" ".join(cleaned_lines).lower().split())
+
+
+def normalize_diff(diff: str) -> str:
+    """Strip commit blob hashes and hunk header line numbers from git patch diffs."""
+    diff = re.sub(r"^index [0-9a-fA-F]+\.\.[0-9a-fA-F]+.*$\n?", "", diff, flags=re.MULTILINE)
+    diff = re.sub(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", "@@", diff)
+    return diff.strip()
 
 
 def compute_similarity(s1: str, s2: str) -> float:
@@ -289,6 +296,103 @@ class Workers:
         return sha_to_info
 
     @staticmethod
+    def fetch_commit_diffs(args: Tuple[str, List[str]]) -> Dict[str, str]:
+        """Worker function: Stream file change diffs for a chunk of SHAs and return normalized diffs."""
+        repo_path, shas = args
+        input_shas = "\n".join(shas) + "\n"
+
+        cmd = [
+            "git",
+            "--no-pager",
+            "log",
+            "--ignore-missing",
+            "--no-walk",
+            "--no-merges",
+            "--stdin",
+            "-p",
+            "--no-renames",
+            "--format=COMMIT %H",
+            "--no-color",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            errors="replace",
+            bufsize=1024 * 1024,
+        )
+        try:
+            proc.stdin.write(input_shas)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        sha_to_diff = {}
+        current_sha = None
+        current_diff_lines = []
+
+        for line in proc.stdout:
+            if line.startswith("COMMIT "):
+                if current_sha:
+                    sha_to_diff[current_sha] = normalize_diff("".join(current_diff_lines))
+                current_sha = line[7:].strip().lower()
+                current_diff_lines = []
+            elif current_sha:
+                current_diff_lines.append(line)
+
+        if current_sha:
+            sha_to_diff[current_sha] = normalize_diff("".join(current_diff_lines))
+
+        proc.stdout.close()
+        proc.wait()
+        return sha_to_diff
+
+    @staticmethod
+    def compute_group_similarities(
+        args: Tuple[List[List[str]], Dict[str, str]]
+    ) -> Tuple[int, List[Tuple[str, float]]]:
+        """Worker function: Compute symmetric peer similarity scores for groups of commits."""
+        groups, sha_to_diff = args
+        results = []
+
+        for group in groups:
+            n = len(group)
+            if n < 2:
+                for sha in group:
+                    results.append((sha, 1.0))
+                continue
+
+            # Compute unique pairwise similarities once (Symmetric Cache)
+            pair_sims = {}
+            for i in range(n):
+                s1 = group[i]
+                # Cap diff length at 10k chars for fast similarity evaluation
+                d1 = sha_to_diff.get(s1, "")[:10000]
+                for j in range(i + 1, n):
+                    s2 = group[j]
+                    d2 = sha_to_diff.get(s2, "")[:10000]
+
+                    if not d1 and not d2:
+                        sim = 1.0
+                    elif not d1 or not d2:
+                        sim = 0.0
+                    else:
+                        sim = compute_similarity(d1, d2)
+
+                    pair_sims[(s1, s2)] = sim
+                    pair_sims[(s2, s1)] = sim
+
+            for sha in group:
+                peers = [p for p in group if p != sha]
+                sims = [pair_sims[(sha, p)] for p in peers]
+                avg_sim = round(sum(sims) / len(sims), 4)
+                results.append((sha, avg_sim))
+
+        return len(groups), results
+
+    @staticmethod
     def process_subject_bucket(
         chunk_buckets: List[List[CommitInfo]],
     ) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str, float]]]:
@@ -301,19 +405,16 @@ class Workers:
             n = len(commits)
             matched_in_bucket = set()
 
-            # 1. Author Date & Clean Body verification within 75-day window
             for i in range(n):
                 c1 = commits[i]
                 for j in range(i + 1, n):
                     c2 = commits[j]
 
-                    # Enforce file overlap check
                     if c1.files and c2.files and not (c1.files & c2.files):
                         continue
 
                     time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
 
-                    # Reject any candidate pair beyond 1 kernel version cycle on master branch
                     if time_diff > MAX_MAINLINE_CYCLE_GAP:
                         continue
 
@@ -321,14 +422,12 @@ class Workers:
                     is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
                     is_meaningful_body = len(c1.cleaned_body) > 30 and len(c2.cleaned_body) > 30
 
-                    # Evaluate body similarity for timestamp matches to prevent batch/scripted commit false positives
                     body_sim = 1.0
                     if c1.cleaned_body and c2.cleaned_body:
                         body_sim = compute_similarity(c1.cleaned_body, c2.cleaned_body)
                     elif bool(c1.cleaned_body) != bool(c2.cleaned_body):
                         body_sim = 0.0
 
-                    # Require body similarity threshold (>= 0.75) even when author timestamps match
                     if is_author_date_match and body_sim >= 0.75:
                         author_date_matches.append((c1.sha, c2.sha))
                         matched_in_bucket.add(c1.sha)
@@ -338,7 +437,6 @@ class Workers:
                         matched_in_bucket.add(c1.sha)
                         matched_in_bucket.add(c2.sha)
 
-            # 2. Fuzzy Body matching for remaining unmatched items in 75-day window
             unmatched = [
                 c for c in commits if c.sha not in matched_in_bucket and c.cleaned_body
             ]
@@ -349,7 +447,6 @@ class Workers:
                     for j in range(i + 1, len(unmatched)):
                         c2 = unmatched[j]
 
-                        # Enforce file overlap check for fuzzy matches
                         if c1.files and c2.files and not (c1.files & c2.files):
                             continue
 
@@ -518,8 +615,6 @@ def run_metadata_pass(
                             tag_match_count += 1
                         sha_detection[sha].add(DetectionType.CHERRY_PICK_TAG)
                         sha_detection[original_sha].add(DetectionType.CHERRY_PICK_TAG)
-                        sha_similarity[sha] = max(sha_similarity[sha], 1.0)
-                        sha_similarity[original_sha] = max(sha_similarity[original_sha], 1.0)
 
     print(f"  -> Detected {tag_match_count:,} new commits via explicit cherry-pick tags.")
     return sha_to_subject, sha_to_meta, tag_match_count
@@ -575,8 +670,6 @@ def run_subject_bucket_pass(
                     dsu.union(sha1, sha2)
                     sha_detection[sha1].add(DetectionType.SUBJECT_AND_TIMESTAMP)
                     sha_detection[sha2].add(DetectionType.SUBJECT_AND_TIMESTAMP)
-                    sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
-                    sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
                         stats["ad_groups"] += 1
@@ -589,8 +682,6 @@ def run_subject_bucket_pass(
                     dsu.union(sha1, sha2)
                     sha_detection[sha1].add(DetectionType.SUBJECT_AND_MESSAGE)
                     sha_detection[sha2].add(DetectionType.SUBJECT_AND_MESSAGE)
-                    sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
-                    sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
                         stats["clean_groups"] += 1
@@ -603,8 +694,6 @@ def run_subject_bucket_pass(
                     dsu.union(sha1, sha2)
                     sha_detection[sha1].add(DetectionType.SUBJECT_AND_FUZZY_MESSAGE)
                     sha_detection[sha2].add(DetectionType.SUBJECT_AND_FUZZY_MESSAGE)
-                    sha_similarity[sha1] = max(sha_similarity[sha1], sim)
-                    sha_similarity[sha2] = max(sha_similarity[sha2], sim)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
                         stats["fuzzy_groups"] += 1
@@ -674,7 +763,6 @@ def run_patch_id_fallback_pass(
 
                 for s in shas:
                     sha_detection[s].add(DetectionType.PATCH_DIFF_MATCH)
-                    sha_similarity[s] = max(sha_similarity[s], 1.0)
 
                 new_in_group = [s for s in shas if s in new_commits_set]
                 if new_in_group:
@@ -684,6 +772,87 @@ def run_patch_id_fallback_pass(
         print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID diff matching.")
 
     return patch_group_count, patch_commit_count
+
+
+def run_file_change_similarity_pass(
+    repo_path: str,
+    dsu: DisjointSet,
+    sha_similarity: defaultdict,
+    num_workers: int,
+):
+    """Compute file change similarity index in parallel with optimized LPT scheduling."""
+    root_to_members = defaultdict(list)
+    for sha in list(dsu.parent.keys()):
+        root = dsu.find(sha)
+        root_to_members[root].append(sha)
+
+    group_members_list = [members for members in root_to_members.values() if len(members) >= 2]
+    all_grouped_shas = [sha for members in group_members_list for sha in members]
+
+    if not all_grouped_shas:
+        return
+
+    print(
+        f"Computing file change similarity for {len(all_grouped_shas):,} grouped commits across {len(group_members_list):,} groups..."
+    )
+
+    # 1. Stream diffs in parallel
+    diff_chunks = [
+        (repo_path, all_grouped_shas[i : i + CHUNK_SIZE])
+        for i in range(0, len(all_grouped_shas), CHUNK_SIZE)
+    ]
+
+    sha_to_diff: Dict[str, str] = {}
+    processed_diff_chunks = 0
+    total_diff_chunks = len(diff_chunks)
+
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        for chunk_diffs in pool.imap_unordered(Workers.fetch_commit_diffs, diff_chunks):
+            sha_to_diff.update(chunk_diffs)
+            processed_diff_chunks += 1
+            pct = (processed_diff_chunks / total_diff_chunks) * 100
+            sys.stdout.write(
+                f"\r\033[K  Diff Stream: {processed_diff_chunks:,}/{total_diff_chunks:,} chunks fetched ({pct:.1f}%)"
+            )
+            sys.stdout.flush()
+
+        pct = (processed_diff_chunks / total_diff_chunks) * 100 if total_diff_chunks else 100.0
+        sys.stdout.write(
+            f"\r\033[K  Diff Stream: {processed_diff_chunks:,}/{total_diff_chunks:,} chunks fetched ({pct:.1f}%)\n"
+        )
+        sys.stdout.flush()
+
+        # 2. Sort groups by estimated workload (N^2) descending (LPT Scheduling)
+        group_members_list.sort(key=lambda g: len(g), reverse=True)
+
+        # Use finer chunk size to prevent stragglers
+        group_chunk_size = max(1, len(group_members_list) // (num_workers * 16))
+        group_chunks = [
+            (group_members_list[i : i + group_chunk_size], sha_to_diff)
+            for i in range(0, len(group_members_list), group_chunk_size)
+        ]
+
+        processed_groups = 0
+        total_groups = len(group_members_list)
+
+        for count, chunk_results in pool.imap_unordered(
+            Workers.compute_group_similarities, group_chunks
+        ):
+            processed_groups += count
+            for sha, sim in chunk_results:
+                sha_similarity[sha] = sim
+
+            pct = min((processed_groups / total_groups) * 100, 100.0)
+            sys.stdout.write(
+                f"\r\033[K  Group Similarity Calculation: {processed_groups:,}/{total_groups:,} groups evaluated ({pct:.1f}%)"
+            )
+            sys.stdout.flush()
+
+        pct = min((processed_groups / total_groups) * 100, 100.0) if total_groups else 100.0
+        sys.stdout.write(
+            f"\r\033[K  Group Similarity Calculation: {processed_groups:,}/{total_groups:,} groups evaluated ({pct:.1f}%)\n"
+        )
+        sys.stdout.flush()
 
 
 def print_detection_summary(
@@ -792,9 +961,9 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         f"Found {total_new_commits:,} new commits. Using {num_workers} CPU cores for processing."
     )
     if HAS_RAPIDFUZZ:
-        print("Using rapidfuzz (C++ engine) for high-performance fuzzy body matching.")
+        print("Using rapidfuzz (C++ engine) for high-performance fuzzy matching.")
     else:
-        print("Using difflib fallback for fuzzy body matching.")
+        print("Using difflib fallback for fuzzy matching.")
 
     dsu = DisjointSet()
     existing_sha_to_gid, sha_detection, sha_similarity = load_existing_db_state(conn, dsu)
@@ -817,7 +986,12 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         repo_path, subject_to_shas, sha_to_subject, new_commits_set, dsu, sha_detection, sha_similarity, num_workers
     )
 
-    # 4. Summary & DB Persistence
+    # 4. Parallel File Change Similarity Pass
+    run_file_change_similarity_pass(
+        repo_path, dsu, sha_similarity, num_workers
+    )
+
+    # 5. Summary & DB Persistence
     print_detection_summary(tag_match_count, bucket_stats, patch_group_count, patch_commit_count)
 
     latest_commit = new_commits[-1] if new_commits else None
