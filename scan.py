@@ -15,6 +15,7 @@ from typing import List, Optional, Set, Tuple
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
+BUCKET_CHUNK_SIZE = 500  # Number of subject buckets per worker task
 TRAILER_LINE_RE = re.compile(
     r"^[A-Za-z0-9-]+:\s+.*$|^[A-Za-z0-9-]+\s+#\d+.*$", re.IGNORECASE
 )
@@ -246,6 +247,42 @@ def process_patch_id_chunk(args: Tuple[str, List[str]]) -> Tuple[List[Tuple[str,
     return raw_patch_results, sha_to_info
 
 
+def process_subject_bucket_chunk(
+    chunk_buckets: List[List[Tuple[str, str]]]
+) -> Tuple[int, List[List[str]], List[Tuple[str, str]]]:
+    """Worker function: Evaluates subject buckets in parallel for clean and fuzzy body matches."""
+    clean_matches = []
+    fuzzy_matches = []
+
+    for sha_tuples in chunk_buckets:
+        body_to_shas = defaultdict(list)
+        for sha, cb in sha_tuples:
+            if cb:
+                body_to_shas[cb].append(sha)
+
+        matched_in_subject = set()
+        for cb, group_shas in body_to_shas.items():
+            if len(group_shas) > 1:
+                clean_matches.append(group_shas)
+                matched_in_subject.update(group_shas)
+
+        unmatched = [
+            (sha, cb) for sha, cb in sha_tuples if sha not in matched_in_subject and cb
+        ]
+        if len(unmatched) > 1:
+            for i in range(len(unmatched)):
+                sha1, cb1 = unmatched[i]
+                for j in range(i + 1, len(unmatched)):
+                    sha2, cb2 = unmatched[j]
+                    len1, len2 = len(cb1), len(cb2)
+                    if min(len1, len2) / max(len1, len2) < 0.70:
+                        continue
+                    if difflib.SequenceMatcher(None, cb1, cb2).ratio() >= 0.85:
+                        fuzzy_matches.append((sha1, sha2))
+
+    return len(chunk_buckets), clean_matches, fuzzy_matches
+
+
 def stream_commit_messages(repo_path: str, rev_spec: str):
     """Streams commit hashes and message bodies using binary-safe NUL (-z) delimiters."""
     cmd = [
@@ -451,77 +488,76 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                 patch_group_count += 1
                 patch_commit_count += len(new_in_group)
 
-    # Pass 2 & 3: Group by subject buckets for Clean Body & Fuzzy Body matching
-    print("Evaluating subject buckets for trailer-stripped and fuzzy body matches...")
+    # Pass 2 & 3: Parallel evaluation of subject buckets for Clean Body & Fuzzy Body matching
     subject_to_shas = defaultdict(list)
     for sha, subj in sha_to_subject.items():
         if subj:
             subject_to_shas[subj].append(sha)
+
+    candidate_buckets = [
+        [(s, sha_to_cleaned_body.get(s, "")) for s in shas]
+        for shas in subject_to_shas.values()
+        if len(shas) >= 2
+    ]
 
     clean_body_group_count = 0
     clean_body_commit_count = 0
     fuzzy_body_group_count = 0
     fuzzy_body_commit_count = 0
 
-    for subj, shas in subject_to_shas.items():
-        if len(shas) < 2:
-            continue
+    if candidate_buckets:
+        print(
+            f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers..."
+        )
+        bucket_chunks = [
+            candidate_buckets[i : i + BUCKET_CHUNK_SIZE]
+            for i in range(0, len(candidate_buckets), BUCKET_CHUNK_SIZE)
+        ]
 
-        # Pass 2: Exact Trailer-Stripped Body Match
-        body_to_shas = defaultdict(list)
-        for sha in shas:
-            cb = sha_to_cleaned_body.get(sha, "")
-            if cb:
-                body_to_shas[cb].append(sha)
+        processed_buckets = 0
+        total_buckets = len(candidate_buckets)
 
-        matched_in_subject = set()
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            for count, clean_matches, fuzzy_matches in pool.imap_unordered(
+                process_subject_bucket_chunk, bucket_chunks
+            ):
+                processed_buckets += count
 
-        for cb, group_shas in body_to_shas.items():
-            if len(group_shas) > 1:
-                first_sha = group_shas[0]
-                for other_sha in group_shas[1:]:
-                    dsu.union(first_sha, other_sha)
+                for group_shas in clean_matches:
+                    first_sha = group_shas[0]
+                    for other_sha in group_shas[1:]:
+                        dsu.union(first_sha, other_sha)
 
-                for s in group_shas:
-                    sha_detection[s].add(DetectionType.SUBJECT_CLEAN_BODY)
-                    matched_in_subject.add(s)
+                    for s in group_shas:
+                        sha_detection[s].add(DetectionType.SUBJECT_CLEAN_BODY)
 
-                new_in_group = [s for s in group_shas if s in new_commits_set]
-                if new_in_group:
-                    clean_body_group_count += 1
-                    clean_body_commit_count += len(new_in_group)
+                    new_in_group = [s for s in group_shas if s in new_commits_set]
+                    if new_in_group:
+                        clean_body_group_count += 1
+                        clean_body_commit_count += len(new_in_group)
 
-        # Pass 3: Fuzzy Body Match on remaining unmatched SHAs in bucket
-        unmatched_shas = [s for s in shas if s not in matched_in_subject]
-        if len(unmatched_shas) > 1:
-            for i in range(len(unmatched_shas)):
-                sha1 = unmatched_shas[i]
-                cb1 = sha_to_cleaned_body.get(sha1, "")
-                if not cb1:
-                    continue
-                for j in range(i + 1, len(unmatched_shas)):
-                    sha2 = unmatched_shas[j]
-                    cb2 = sha_to_cleaned_body.get(sha2, "")
-                    if not cb2:
-                        continue
+                for sha1, sha2 in fuzzy_matches:
+                    dsu.union(sha1, sha2)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_FUZZY_BODY)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_FUZZY_BODY)
 
-                    # Quick ratio bound check on string lengths
-                    len1, len2 = len(cb1), len(cb2)
-                    if min(len1, len2) / max(len1, len2) < 0.70:
-                        continue
+                    if sha1 in new_commits_set or sha2 in new_commits_set:
+                        fuzzy_body_group_count += 1
+                        if sha1 in new_commits_set:
+                            fuzzy_body_commit_count += 1
+                        if sha2 in new_commits_set:
+                            fuzzy_body_commit_count += 1
 
-                    ratio = difflib.SequenceMatcher(None, cb1, cb2).ratio()
-                    if ratio >= 0.85:
-                        dsu.union(sha1, sha2)
-                        sha_detection[sha1].add(DetectionType.SUBJECT_FUZZY_BODY)
-                        sha_detection[sha2].add(DetectionType.SUBJECT_FUZZY_BODY)
+                pct = min((processed_buckets / total_buckets) * 100, 100.0)
+                sys.stdout.write(
+                    f"\r\033[K  Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} buckets evaluated ({pct:.1f}%)"
+                )
+                sys.stdout.flush()
 
-                        if sha1 in new_commits_set or sha2 in new_commits_set:
-                            fuzzy_body_group_count += 1
-                            if sha1 in new_commits_set:
-                                fuzzy_body_commit_count += 1
-                            if sha2 in new_commits_set:
-                                fuzzy_body_commit_count += 1
+        sys.stdout.write(
+            f"\r\033[K  Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} buckets evaluated ({pct:.1f}%)\n"
+        )
+        sys.stdout.flush()
 
     print("\n--- Detection Summary (Current Run Only) ---")
     print(f"  Explicit Tags Found     : {tag_match_count:,} commits")
