@@ -7,6 +7,13 @@ import sys
 
 DB_NAME = "git-together.db"
 
+DETECTION_LABELS = {
+    1: "Explicit Cherry-Pick Tag",
+    2: "Subject + Clean Body Match",
+    3: "Subject + Fuzzy Body Match",
+    4: "Patch-ID + Subject Fallback",
+}
+
 EXAMPLES_TEXT = """examples:
   python3 lookup.py e4e9b9248ff       # Lookup sibling hashes for a commit SHA
   python3 lookup.py e4e9b9248ff 1042a  # Compare two SHAs (exits with code 0 on match, 1 otherwise)
@@ -150,7 +157,7 @@ def smart_lookup(db_path: str, target: str):
 
 
 def show_stats(db_path: str):
-    """Displays key statistics and metrics for the SQLite database."""
+    """Displays key statistics, detection breakdowns, and metrics for the SQLite database."""
     if not os.path.exists(db_path):
         sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
         sys.exit(1)
@@ -163,6 +170,10 @@ def show_stats(db_path: str):
 
     cur.execute("SELECT COUNT(DISTINCT group_id) FROM hashes")
     total_groups = cur.fetchone()[0]
+
+    # Detection type breakdown query
+    cur.execute("SELECT detection_type, COUNT(*) FROM hashes GROUP BY detection_type")
+    type_counts = dict(cur.fetchall())
 
     min_sz, max_sz, avg_sz = (0, 0, 0.0)
     top_groups = []
@@ -201,8 +212,25 @@ def show_stats(db_path: str):
     print("---------------------------------------------")
     print(f"Total Linked Hashes:  {total_hashes:,}")
     print(f"Total Unique Groups:  {total_groups:,}")
+    print("---------------------------------------------")
+    print("Detection Type Breakdown:")
+
+    if total_hashes > 0:
+        for dt_code, label in DETECTION_LABELS.items():
+            cnt = type_counts.get(dt_code, 0)
+            pct = (cnt / total_hashes) * 100.0
+            print(f"  - {label:<27}: {cnt:>8,} ({pct:5.1f}%)")
+
+        # Display any unknown/unmapped detection type codes if present
+        for dt_code, cnt in type_counts.items():
+            if dt_code not in DETECTION_LABELS:
+                pct = (cnt / total_hashes) * 100.0
+                print(f"  - Unknown Type #{dt_code:<15}: {cnt:>8,} ({pct:5.1f}%)")
+    else:
+        print("  (No entry records in database)")
 
     if total_groups > 0:
+        print("---------------------------------------------")
         print(f"Min Group Size:       {min_sz}")
         print(f"Max Group Size:       {max_sz}")
         print(f"Avg Group Size:       {avg_sz:.2f} hashes/group")
@@ -250,4 +278,3 @@ if __name__ == "__main__":
     else:
         parser.print_help(sys.stderr)
         sys.exit(1)
-
