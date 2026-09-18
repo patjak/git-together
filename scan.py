@@ -187,198 +187,207 @@ def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
         return []
 
 
-def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> Dict[str, CommitInfo]:
-    """Worker function: Stream author, dates, subject and body metadata for a chunk of SHAs."""
-    repo_path, shas = args
-    input_shas = "\n".join(shas) + "\n"
+# -----------------------------------------------------------------------------
+# Process Workers Namespace
+# -----------------------------------------------------------------------------
 
-    sha_to_info = {}
-    cmd = [
-        "git",
-        "--no-pager",
-        "log",
-        "-z",
-        "--ignore-missing",
-        "--no-walk",
-        "--no-merges",
-        "--stdin",
-        "--format=%H%n%an%n%at%n%ct%n%s%n%b",
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_path,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        bufsize=1024 * 1024,
-    )
-    try:
-        proc.stdin.write(input_shas.encode("utf-8"))
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
+class Workers:
+    """Isolated, picklable multiprocessing task handlers."""
 
-    buffer = bytearray()
-    while True:
-        chunk = proc.stdout.read(65536)
-        if not chunk:
-            break
-        buffer.extend(chunk)
-        while b"\x00" in buffer:
-            pos = buffer.index(b"\x00")
-            record = buffer[:pos].decode("utf-8", errors="replace")
-            del buffer[: pos + 1]
-            if record:
-                parts = record.split("\n", 5)
-                if len(parts) >= 5 and len(parts[0].strip()) == 40:
-                    sha = parts[0].strip().lower()
-                    author_name = parts[1].strip()
-                    try:
-                        author_date = int(parts[2].strip())
-                    except ValueError:
-                        author_date = 0
-                    try:
-                        committer_date = int(parts[3].strip())
-                    except ValueError:
-                        committer_date = 0
-                    subject = parts[4].strip()
-                    body = parts[5] if len(parts) > 5 else ""
-                    cleaned_body = strip_trailers_and_normalize(body)
+    @staticmethod
+    def fetch_commit_metadata(args: Tuple[str, List[str]]) -> Dict[str, CommitInfo]:
+        """Worker function: Stream author, dates, subject and body metadata for a chunk of SHAs."""
+        repo_path, shas = args
+        input_shas = "\n".join(shas) + "\n"
 
-                    sha_to_info[sha] = CommitInfo(
-                        sha=sha,
-                        author_name=author_name,
-                        author_date=author_date,
-                        committer_date=committer_date,
-                        subject=subject,
-                        body=body,
-                        cleaned_body=cleaned_body,
-                    )
-
-    proc.stdout.close()
-    proc.wait()
-    return sha_to_info
-
-
-def process_subject_bucket_chunk(
-    chunk_buckets: List[List[CommitInfo]],
-) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str, float]]]:
-    author_date_matches = []
-    clean_matches = []
-    fuzzy_matches = []
-
-    for commits in chunk_buckets:
-        n = len(commits)
-        matched_in_bucket = set()
-
-        # 1. Author Date & Clean Body verification within 75-day window
-        for i in range(n):
-            c1 = commits[i]
-            for j in range(i + 1, n):
-                c2 = commits[j]
-
-                time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
-
-                # Reject any candidate pair beyond 1 kernel version cycle on master branch
-                if time_diff > MAX_MAINLINE_CYCLE_GAP:
-                    continue
-
-                is_author_date_match = c1.author_date > 0 and c1.author_date == c2.author_date
-                is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
-
-                if is_author_date_match:
-                    author_date_matches.append((c1.sha, c2.sha))
-                    matched_in_bucket.add(c1.sha)
-                    matched_in_bucket.add(c2.sha)
-                elif is_clean_body_match:
-                    clean_matches.append((c1.sha, c2.sha))
-                    matched_in_bucket.add(c1.sha)
-                    matched_in_bucket.add(c2.sha)
-
-        # 2. Fuzzy Body matching for remaining unmatched items in 75-day window
-        unmatched = [
-            c for c in commits if c.sha not in matched_in_bucket and c.cleaned_body
+        sha_to_info = {}
+        cmd = [
+            "git",
+            "--no-pager",
+            "log",
+            "-z",
+            "--ignore-missing",
+            "--no-walk",
+            "--no-merges",
+            "--stdin",
+            "--format=%H%n%an%n%at%n%ct%n%s%n%b",
         ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            bufsize=1024 * 1024,
+        )
+        try:
+            proc.stdin.write(input_shas.encode("utf-8"))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
 
-        if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
-            for i in range(len(unmatched)):
-                c1 = unmatched[i]
-                for j in range(i + 1, len(unmatched)):
-                    c2 = unmatched[j]
+        buffer = bytearray()
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while b"\x00" in buffer:
+                pos = buffer.index(b"\x00")
+                record = buffer[:pos].decode("utf-8", errors="replace")
+                del buffer[: pos + 1]
+                if record:
+                    parts = record.split("\n", 5)
+                    if len(parts) >= 5 and len(parts[0].strip()) == 40:
+                        sha = parts[0].strip().lower()
+                        author_name = parts[1].strip()
+                        try:
+                            author_date = int(parts[2].strip())
+                        except ValueError:
+                            author_date = 0
+                        try:
+                            committer_date = int(parts[3].strip())
+                        except ValueError:
+                            committer_date = 0
+                        subject = parts[4].strip()
+                        body = parts[5] if len(parts) > 5 else ""
+                        cleaned_body = strip_trailers_and_normalize(body)
+
+                        sha_to_info[sha] = CommitInfo(
+                            sha=sha,
+                            author_name=author_name,
+                            author_date=author_date,
+                            committer_date=committer_date,
+                            subject=subject,
+                            body=body,
+                            cleaned_body=cleaned_body,
+                        )
+
+        proc.stdout.close()
+        proc.wait()
+        return sha_to_info
+
+    @staticmethod
+    def process_subject_bucket(
+        chunk_buckets: List[List[CommitInfo]],
+    ) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str, float]]]:
+        """Worker function: Compare commits within subject buckets across strict matching tiers."""
+        author_date_matches = []
+        clean_matches = []
+        fuzzy_matches = []
+
+        for commits in chunk_buckets:
+            n = len(commits)
+            matched_in_bucket = set()
+
+            # 1. Author Date & Clean Body verification within 75-day window
+            for i in range(n):
+                c1 = commits[i]
+                for j in range(i + 1, n):
+                    c2 = commits[j]
 
                     time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
+
+                    # Reject any candidate pair beyond 1 kernel version cycle on master branch
                     if time_diff > MAX_MAINLINE_CYCLE_GAP:
                         continue
 
-                    len1, len2 = len(c1.cleaned_body), len(c2.cleaned_body)
-                    if min(len1, len2) / max(len1, len2) < 0.70:
-                        continue
+                    is_author_date_match = c1.author_date > 0 and c1.author_date == c2.author_date
+                    is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
 
-                    sim = compute_similarity(c1.cleaned_body, c2.cleaned_body)
-                    authors_same = c1.author_name.lower() == c2.author_name.lower()
-                    required_sim = 0.85 if authors_same else 0.90
+                    if is_author_date_match:
+                        author_date_matches.append((c1.sha, c2.sha))
+                        matched_in_bucket.add(c1.sha)
+                        matched_in_bucket.add(c2.sha)
+                    elif is_clean_body_match:
+                        clean_matches.append((c1.sha, c2.sha))
+                        matched_in_bucket.add(c1.sha)
+                        matched_in_bucket.add(c2.sha)
 
-                    if sim >= required_sim:
-                        fuzzy_matches.append((c1.sha, c2.sha, sim))
+            # 2. Fuzzy Body matching for remaining unmatched items in 75-day window
+            unmatched = [
+                c for c in commits if c.sha not in matched_in_bucket and c.cleaned_body
+            ]
 
-    return len(chunk_buckets), author_date_matches, clean_matches, fuzzy_matches
+            if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
+                for i in range(len(unmatched)):
+                    c1 = unmatched[i]
+                    for j in range(i + 1, len(unmatched)):
+                        c2 = unmatched[j]
 
+                        time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
+                        if time_diff > MAX_MAINLINE_CYCLE_GAP:
+                            continue
 
-def process_fallback_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[str, str]]:
-    """Worker function: Compute patch IDs ONLY for remaining fallback candidate SHAs."""
-    repo_path, shas = args
-    input_shas = "\n".join(shas) + "\n"
+                        len1, len2 = len(c1.cleaned_body), len(c2.cleaned_body)
+                        if min(len1, len2) / max(len1, len2) < 0.70:
+                            continue
 
-    log_cmd = [
-        "git",
-        "--no-pager",
-        "log",
-        "--ignore-missing",
-        "--no-walk",
-        "--no-merges",
-        "--stdin",
-        "-p",
-        "--no-renames",
-        "--no-abbrev-commit",
-    ]
-    log_proc = subprocess.Popen(
-        log_cmd,
-        cwd=repo_path,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        universal_newlines=True,
-        errors="replace",
-        bufsize=1024 * 1024,
-    )
+                        sim = compute_similarity(c1.cleaned_body, c2.cleaned_body)
+                        authors_same = c1.author_name.lower() == c2.author_name.lower()
+                        required_sim = 0.85 if authors_same else 0.90
 
-    patch_cmd = ["git", "patch-id", "--stable"]
-    patch_proc = subprocess.Popen(
-        patch_cmd,
-        stdin=log_proc.stdout,
-        stdout=subprocess.PIPE,
-        universal_newlines=True,
-        errors="replace",
-        bufsize=1024 * 1024,
-    )
-    log_proc.stdout.close()
+                        if sim >= required_sim:
+                            fuzzy_matches.append((c1.sha, c2.sha, sim))
 
-    try:
-        log_proc.stdin.write(input_shas)
-        log_proc.stdin.close()
-    except BrokenPipeError:
-        pass
+        return len(chunk_buckets), author_date_matches, clean_matches, fuzzy_matches
 
-    results = []
-    for line in patch_proc.stdout:
-        parts = line.strip().split()
-        if len(parts) == 2:
-            patch_id, sha = parts[0], parts[1].lower()
-            if len(sha) == 40:
-                results.append((patch_id, sha))
+    @staticmethod
+    def process_fallback_patch_id(args: Tuple[str, List[str]]) -> List[Tuple[str, str]]:
+        """Worker function: Compute patch IDs ONLY for remaining fallback candidate SHAs."""
+        repo_path, shas = args
+        input_shas = "\n".join(shas) + "\n"
 
-    patch_proc.stdout.close()
-    patch_proc.wait()
-    log_proc.wait()
-    return results
+        log_cmd = [
+            "git",
+            "--no-pager",
+            "log",
+            "--ignore-missing",
+            "--no-walk",
+            "--no-merges",
+            "--stdin",
+            "-p",
+            "--no-renames",
+            "--no-abbrev-commit",
+        ]
+        log_proc = subprocess.Popen(
+            log_cmd,
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            errors="replace",
+            bufsize=1024 * 1024,
+        )
+
+        patch_cmd = ["git", "patch-id", "--stable"]
+        patch_proc = subprocess.Popen(
+            patch_cmd,
+            stdin=log_proc.stdout,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            errors="replace",
+            bufsize=1024 * 1024,
+        )
+        log_proc.stdout.close()
+
+        try:
+            log_proc.stdin.write(input_shas)
+            log_proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        results = []
+        for line in patch_proc.stdout:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                patch_id, sha = parts[0], parts[1].lower()
+                if len(sha) == 40:
+                    results.append((patch_id, sha))
+
+        patch_proc.stdout.close()
+        patch_proc.wait()
+        log_proc.wait()
+        return results
 
 
 # -----------------------------------------------------------------------------
@@ -455,7 +464,7 @@ def run_metadata_pass(
     tag_match_count = 0
 
     with multiprocessing.Pool(processes=num_workers) as pool:
-        for chunk_info in pool.imap_unordered(fetch_commit_metadata_chunk, chunks):
+        for chunk_info in pool.imap_unordered(Workers.fetch_commit_metadata, chunks):
             for sha, info in chunk_info.items():
                 sha_to_subject[sha] = info.subject
                 sha_to_meta[sha] = info
@@ -519,7 +528,7 @@ def run_subject_bucket_pass(
 
         with multiprocessing.Pool(processes=num_workers) as pool:
             for count, ad_matches, clean_matches, fuzzy_matches in pool.imap_unordered(
-                process_subject_bucket_chunk, bucket_chunks
+                Workers.process_subject_bucket, bucket_chunks
             ):
                 processed_buckets += count
 
@@ -613,7 +622,7 @@ def run_patch_id_fallback_pass(
 
         patch_to_shas = defaultdict(list)
         with multiprocessing.Pool(processes=num_workers) as pool:
-            for chunk_results in pool.imap_unordered(process_fallback_patch_id_chunk, fb_chunks):
+            for chunk_results in pool.imap_unordered(Workers.process_fallback_patch_id, fb_chunks):
                 for patch_id, sha in chunk_results:
                     subj = sha_to_subject.get(sha, "")
                     patch_to_shas[(patch_id, subj)].append(sha)
