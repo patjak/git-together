@@ -9,6 +9,7 @@ import sys
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -19,6 +20,74 @@ DETECTION_NAMES = {
     4: "SUBJECT_AND_FUZZY_MESSAGE",
     5: "PATCH_DIFF_MATCH",
 }
+
+CANCEL = object()
+
+
+class FilterModal(ModalScreen):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    FilterModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.6);
+    }
+
+    #filter-dialog {
+        width: 45;
+        height: 14;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #filter-title {
+        background: $accent;
+        color: $text;
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        padding: 0 1;
+    }
+
+    FilterModal OptionList {
+        height: 100%;
+        border: none;
+    }
+    """
+
+    def __init__(self, current_selection: int | None = None):
+        super().__init__()
+        self.current_selection = current_selection
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="filter-dialog"):
+            yield Label("Filter by Detection Type", id="filter-title")
+            yield OptionList(id="filter-options")
+
+    def on_mount(self) -> None:
+        option_list = self.query_one("#filter-options", OptionList)
+        option_list.add_option(Option("All Detection Types", id="all"))
+
+        highlight_idx = 0
+        idx = 1
+        for dt_id, dt_name in DETECTION_NAMES.items():
+            option_list.add_option(Option(dt_name, id=str(dt_id)))
+            if dt_id == self.current_selection:
+                highlight_idx = idx
+            idx += 1
+
+        option_list.highlighted = highlight_idx
+        option_list.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(CANCEL)
+
+    @on(OptionList.OptionSelected, "#filter-options")
+    def on_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id == "all":
+            self.dismiss(None)
+        else:
+            self.dismiss(int(event.option.id))
 
 
 class CommitBrowserApp(App):
@@ -65,6 +134,7 @@ class CommitBrowserApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("f", "filter", "Filter"),
         ("tab", "focus_next", "Focus Next Pane"),
         ("shift+tab", "focus_previous", "Focus Prev Pane"),
     ]
@@ -76,12 +146,13 @@ class CommitBrowserApp(App):
         self.conn = None
         self.group_ids = []
         self.current_shas = []
+        self.selected_detection_type = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
             with Vertical(id="groups-container"):
-                yield Label("Group Section (Largest First)", classes="panel-title")
+                yield Label("Group Section (All)", id="groups-title", classes="panel-title")
                 yield OptionList(id="groups-list")
             with Vertical(id="shas-container"):
                 yield Label("SHA Section", classes="panel-title")
@@ -104,14 +175,48 @@ class CommitBrowserApp(App):
         self.conn = sqlite3.connect(self.db_path)
         self.load_groups()
 
+    def action_filter(self) -> None:
+        def apply_filter(result):
+            if result is CANCEL:
+                return
+            self.selected_detection_type = result
+            self.update_group_title()
+            self.load_groups()
+
+        self.push_screen(FilterModal(self.selected_detection_type), apply_filter)
+
+    def update_group_title(self) -> None:
+        title_label = self.query_one("#groups-title", Label)
+        if self.selected_detection_type is None:
+            title_label.update("Group Section (All)")
+        else:
+            dt_name = DETECTION_NAMES.get(self.selected_detection_type, "Filtered")
+            title_label.update(f"Group Section [{dt_name}]")
+
     def load_groups(self) -> None:
+        if not self.conn:
+            return
         cur = self.conn.cursor()
-        cur.execute("""
-            SELECT group_id, COUNT(*) as cnt 
-            FROM hashes 
-            GROUP BY group_id 
-            ORDER BY cnt DESC, group_id ASC
-        """)
+        if self.selected_detection_type is not None:
+            cur.execute(
+                """
+                SELECT group_id, COUNT(*) as cnt 
+                FROM hashes 
+                WHERE detection_type = ?
+                GROUP BY group_id 
+                ORDER BY cnt DESC, group_id ASC
+            """,
+                (self.selected_detection_type,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT group_id, COUNT(*) as cnt 
+                FROM hashes 
+                GROUP BY group_id 
+                ORDER BY cnt DESC, group_id ASC
+            """
+            )
         rows = cur.fetchall()
 
         groups_list = self.query_one("#groups-list", OptionList)
@@ -127,14 +232,32 @@ class CommitBrowserApp(App):
         if self.group_ids:
             groups_list.highlighted = 0
             self.load_shas_for_group(self.group_ids[0])
+        else:
+            self.current_shas = []
+            shas_list = self.query_one("#shas-list", OptionList)
+            shas_list.clear_options()
+            self.query_one("#commit-view", Static).update("")
 
     def load_shas_for_group(self, group_id: int) -> None:
         cur = self.conn.cursor()
-        cur.execute("""
-            SELECT lower(hex(hash_value)), detection_type, similarity 
-            FROM hashes 
-            WHERE group_id = ?
-        """, (group_id,))
+        if self.selected_detection_type is not None:
+            cur.execute(
+                """
+                SELECT lower(hex(hash_value)), detection_type, similarity 
+                FROM hashes 
+                WHERE group_id = ? AND detection_type = ?
+            """,
+                (group_id, self.selected_detection_type),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT lower(hex(hash_value)), detection_type, similarity 
+                FROM hashes 
+                WHERE group_id = ?
+            """,
+                (group_id,),
+            )
         rows = cur.fetchall()
 
         shas_list = self.query_one("#shas-list", OptionList)
