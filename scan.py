@@ -41,6 +41,7 @@ class DetectionType(IntEnum):
     SUBJECT_CLEAN_BODY = 2
     SUBJECT_FUZZY_BODY = 3
     PATCH_ID_SUBJECT = 4  # Fallback tier for rewritten bodies
+    SUBJECT_AUTHOR_DATE = 5  # High-confidence subject + author timestamp match
 
 
 def strip_trailers_and_normalize(body: str) -> str:
@@ -234,7 +235,8 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
 
 def process_subject_bucket_chunk(
     chunk_buckets: List[List[Tuple[str, str, int, int, str]]]
-) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str, float]]]:
+) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str, float]]]:
+    author_date_matches = []
     clean_matches = []
     fuzzy_matches = []
 
@@ -257,7 +259,11 @@ def process_subject_bucket_chunk(
                 is_author_date_match = ad1 > 0 and ad1 == ad2
                 is_clean_body_match = cb1 and cb2 and cb1 == cb2
 
-                if is_author_date_match or is_clean_body_match:
+                if is_author_date_match:
+                    author_date_matches.append((sha1, sha2))
+                    matched_in_bucket.add(sha1)
+                    matched_in_bucket.add(sha2)
+                elif is_clean_body_match:
                     clean_matches.append((sha1, sha2))
                     matched_in_bucket.add(sha1)
                     matched_in_bucket.add(sha2)
@@ -288,7 +294,7 @@ def process_subject_bucket_chunk(
                     if sim >= required_sim:
                         fuzzy_matches.append((sha1, sha2, sim))
 
-    return len(chunk_buckets), clean_matches, fuzzy_matches
+    return len(chunk_buckets), author_date_matches, clean_matches, fuzzy_matches
 
 
 def process_fallback_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[str, str]]:
@@ -473,6 +479,8 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     ]
     candidate_buckets.sort(key=len, reverse=True)
 
+    author_date_group_count = 0
+    author_date_commit_count = 0
     clean_body_group_count = 0
     clean_body_commit_count = 0
     fuzzy_body_group_count = 0
@@ -491,10 +499,24 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         total_buckets = len(candidate_buckets)
 
         with multiprocessing.Pool(processes=num_workers) as pool:
-            for count, clean_matches, fuzzy_matches in pool.imap_unordered(
+            for count, ad_matches, clean_matches, fuzzy_matches in pool.imap_unordered(
                 process_subject_bucket_chunk, bucket_chunks
             ):
                 processed_buckets += count
+
+                for sha1, sha2 in ad_matches:
+                    dsu.union(sha1, sha2)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_AUTHOR_DATE)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_AUTHOR_DATE)
+                    sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
+                    sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
+
+                    if sha1 in new_commits_set or sha2 in new_commits_set:
+                        author_date_group_count += 1
+                        if sha1 in new_commits_set:
+                            author_date_commit_count += 1
+                        if sha2 in new_commits_set:
+                            author_date_commit_count += 1
 
                 for sha1, sha2 in clean_matches:
                     dsu.union(sha1, sha2)
@@ -582,6 +604,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     print("\n--- Detection Summary (Current Run Only) ---")
     print(f"  Explicit Tags Found     : {tag_match_count:,} commits")
+    print(f"  Subject+Author Date Match: {author_date_commit_count:,} commits ({author_date_group_count:,} groups)")
     print(f"  Subject+Clean Body Match: {clean_body_commit_count:,} commits ({clean_body_group_count:,} groups)")
     print(f"  Subject+Fuzzy Body Match: {fuzzy_body_commit_count:,} commits ({fuzzy_body_group_count:,} groups)")
     print(f"  Patch-ID Fallback Match : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
@@ -618,6 +641,8 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                         types = sha_detection.get(sha, set())
                         if DetectionType.CHERRY_PICK in types:
                             dt_val = DetectionType.CHERRY_PICK
+                        elif DetectionType.SUBJECT_AUTHOR_DATE in types:
+                            dt_val = DetectionType.SUBJECT_AUTHOR_DATE
                         elif DetectionType.SUBJECT_CLEAN_BODY in types:
                             dt_val = DetectionType.SUBJECT_CLEAN_BODY
                         elif DetectionType.SUBJECT_FUZZY_BODY in types:
