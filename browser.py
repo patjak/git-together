@@ -140,6 +140,56 @@ class SearchModal(ModalScreen):
             self.dismiss(CANCEL)
 
 
+class MessageSearchModal(ModalScreen):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    MessageSearchModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.6);
+    }
+
+    #msg-search-dialog {
+        width: 50;
+        height: 9;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #msg-search-title {
+        background: $accent;
+        color: $text;
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        padding: 0 1;
+    }
+
+    #msg-search-input {
+        margin: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="msg-search-dialog"):
+            yield Label("Search Commit Message", id="msg-search-title")
+            yield Input(
+                placeholder="Enter search text (leave blank to clear)...",
+                id="msg-search-input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#msg-search-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(CANCEL)
+
+    @on(Input.Submitted, "#msg-search-input")
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        val = event.value.strip()
+        self.dismiss(val)
+
+
 class CommitBrowserApp(App):
     CSS = """
     Screen {
@@ -185,7 +235,8 @@ class CommitBrowserApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("f", "filter", "Filter"),
-        ("s", "search", "Search"),
+        ("s", "search", "Search SHA"),
+        ("m", "search_message", "Search Msg"),
         ("b", "toggle_blacklist", "Blacklist/Unblacklist"),
         ("B", "toggle_show_blacklisted", "Show/Hide Blacklist"),
         ("tab", "focus_next", "Focus Next Pane"),
@@ -204,6 +255,7 @@ class CommitBrowserApp(App):
         self.target_sha_to_select = None
         self.blacklisted_shas = set()
         self.show_blacklisted = True
+        self.search_msg_query = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -372,7 +424,82 @@ class CommitBrowserApp(App):
 
             self.query_one("#shas-list", OptionList).focus()
 
-        self.push_screen(SearchModal(), perform_search)
+    def action_search_message(self) -> None:
+        def perform_msg_search(query):
+            if query is CANCEL or not self.conn:
+                return
+
+            cur = self.conn.cursor()
+            cur.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS temp_msg_matches (sha TEXT PRIMARY KEY)"
+            )
+            cur.execute("DELETE FROM temp_msg_matches")
+
+            if not query:
+                self.search_msg_query = None
+                self.update_group_title()
+                self.load_groups()
+                self.notify("Message search filter cleared.", severity="information")
+                return
+
+            try:
+                res = subprocess.run(
+                    ["git", "log", "--all", f"--grep={query}", "-i", "--format=%H"],
+                    cwd=self.repo_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    errors="replace",
+                    timeout=15,
+                )
+                if res.returncode != 0:
+                    self.notify(f"Git log search failed: {res.stderr}", severity="error")
+                    return
+            except Exception as e:
+                self.notify(f"Failed to execute git log: {e}", severity="error")
+                return
+
+            matching_shas = [
+                line.strip().lower()
+                for line in res.stdout.splitlines()
+                if line.strip()
+            ]
+
+            if not matching_shas:
+                self.notify(
+                    f"No commit messages matching '{query}' found.", severity="warning"
+                )
+                self.search_msg_query = None
+                self.update_group_title()
+                self.load_groups()
+                return
+
+            cur.executemany(
+                "INSERT OR IGNORE INTO temp_msg_matches VALUES (?)",
+                [(s,) for s in matching_shas],
+            )
+
+            cur.execute(
+                "SELECT COUNT(DISTINCT hash_value) FROM hashes WHERE lower(hex(hash_value)) IN (SELECT sha FROM temp_msg_matches)"
+            )
+            db_count = cur.fetchone()[0]
+
+            self.search_msg_query = query
+            self.update_group_title()
+            self.load_groups()
+
+            if db_count > 0:
+                self.notify(
+                    f"Found {len(matching_shas)} matching commits ({db_count} in database).",
+                    severity="information",
+                )
+            else:
+                self.notify(
+                    f"Found {len(matching_shas)} matching commits in repository, but none in database.",
+                    severity="warning",
+                )
+
+        self.push_screen(MessageSearchModal(), perform_msg_search)
 
     def update_group_title(self) -> None:
         title_label = self.query_one("#groups-title", Label)
@@ -381,8 +508,9 @@ class CommitBrowserApp(App):
             if self.selected_detection_type is None
             else DETECTION_NAMES.get(self.selected_detection_type, "Filtered")
         )
+        msg_str = f" [Msg: '{self.search_msg_query}']" if self.search_msg_query else ""
         blk_str = " [Show Blacklist]" if self.show_blacklisted else ""
-        title_label.update(f"Group Section ({dt_str}){blk_str}")
+        title_label.update(f"Group Section ({dt_str}){msg_str}{blk_str}")
 
     def load_groups(self, target_gid: int | None = None) -> None:
         if not self.conn:
@@ -399,6 +527,11 @@ class CommitBrowserApp(App):
             placeholders = ",".join("?" for _ in self.blacklisted_shas)
             where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
             params.extend(list(self.blacklisted_shas))
+
+        if self.search_msg_query:
+            where_conditions.append(
+                "lower(hex(hash_value)) IN (SELECT sha FROM temp_msg_matches)"
+            )
 
         where_clause = " WHERE " + " AND ".join(where_conditions) if where_conditions else ""
 
@@ -469,6 +602,11 @@ class CommitBrowserApp(App):
             placeholders = ",".join("?" for _ in self.blacklisted_shas)
             where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
             params.extend(list(self.blacklisted_shas))
+
+        if self.search_msg_query:
+            where_conditions.append(
+                "lower(hex(hash_value)) IN (SELECT sha FROM temp_msg_matches)"
+            )
 
         where_clause = " WHERE " + " AND ".join(where_conditions)
 
