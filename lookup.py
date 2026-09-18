@@ -6,6 +6,7 @@ import sqlite3
 import sys
 
 DB_NAME = "git-together.db"
+BLACKLIST_NAME = "blacklisted_shas.txt"
 
 DETECTION_LABELS = {
     1: "Explicit Cherry-Pick Tag",
@@ -20,7 +21,7 @@ EXAMPLES_TEXT = """examples:
   python3 lookup.py e4e9b9248ff 1042a  # Compare two SHAs (exits with code 0 on match, 1 otherwise)
   python3 lookup.py 1042              # Lookup all hashes in Group #1042
   python3 lookup.py stats             # Show database statistics
-  python3 lookup.py --db custom.db 22 # Query against a custom SQLite DB file
+  python3 lookup.py --db custom.db --blacklist custom_blk.txt 22 # Custom DB and blacklist files
 """
 
 
@@ -33,8 +34,23 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} TB"
 
 
-def resolve_sha_group(db_path: str, query_hash: str) -> int:
-    """Resolves a full or short SHA to its group_id."""
+def load_blacklist(blacklist_path: str) -> set:
+    """Loads blacklisted commit SHAs from a text file into a set."""
+    blacklisted = set()
+    if blacklist_path and os.path.exists(blacklist_path):
+        try:
+            with open(blacklist_path, "r") as f:
+                for line in f:
+                    sha = line.strip().lower()
+                    if sha:
+                        blacklisted.add(sha)
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to load blacklist file '{blacklist_path}': {e}\n")
+    return blacklisted
+
+
+def resolve_sha_group(db_path: str, query_hash: str, blacklist: set) -> int:
+    """Resolves a full or short SHA to its group_id, ignoring blacklisted SHAs."""
     if not os.path.exists(db_path):
         sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
         sys.exit(1)
@@ -43,6 +59,10 @@ def resolve_sha_group(db_path: str, query_hash: str) -> int:
 
     if not all(c in "0123456789abcdef" for c in clean_hash):
         sys.stderr.write(f"Error: '{query_hash}' is not a valid hexadecimal commit SHA.\n")
+        sys.exit(1)
+
+    if clean_hash in blacklist and len(clean_hash) == 40:
+        sys.stderr.write(f"Error: Commit SHA '{clean_hash}' not found in database.\n")
         sys.exit(1)
 
     conn = sqlite3.connect(db_path)
@@ -54,7 +74,7 @@ def resolve_sha_group(db_path: str, query_hash: str) -> int:
             "SELECT hex(hash_value) FROM hashes WHERE hex(hash_value) LIKE ?",
             (clean_hash.upper() + "%",),
         )
-        matches = [r[0].lower() for r in cur.fetchall()]
+        matches = [r[0].lower() for r in cur.fetchall() if r[0].lower() not in blacklist]
 
         if not matches:
             sys.stderr.write(f"Error: No commits matching prefix '{clean_hash}' found.\n")
@@ -72,17 +92,17 @@ def resolve_sha_group(db_path: str, query_hash: str) -> int:
     row = cur.fetchone()
     conn.close()
 
-    if not row:
+    if not row or clean_hash in blacklist:
         sys.stderr.write(f"Error: Commit SHA '{clean_hash}' not found in database.\n")
         sys.exit(1)
 
     return row[0]
 
 
-def compare_shas(db_path: str, sha1: str, sha2: str):
+def compare_shas(db_path: str, sha1: str, sha2: str, blacklist: set):
     """Checks if two SHAs belong to the same group and exits with 0 on match or 1 on mismatch."""
-    group1 = resolve_sha_group(db_path, sha1)
-    group2 = resolve_sha_group(db_path, sha2)
+    group1 = resolve_sha_group(db_path, sha1, blacklist)
+    group2 = resolve_sha_group(db_path, sha2, blacklist)
 
     if group1 == group2:
         sys.exit(0)
@@ -90,8 +110,8 @@ def compare_shas(db_path: str, sha1: str, sha2: str):
         sys.exit(1)
 
 
-def lookup_group(db_path: str, group_id: int):
-    """Prints all commit hashes belonging to a specific group_id (one per line)."""
+def lookup_group(db_path: str, group_id: int, blacklist: set):
+    """Prints all non-blacklisted commit hashes belonging to a specific group_id."""
     if not os.path.exists(db_path):
         sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
         sys.exit(1)
@@ -106,12 +126,14 @@ def lookup_group(db_path: str, group_id: int):
     conn.close()
 
     for r in rows:
-        sys.stdout.write(f"{r[0].lower()}\n")
+        sha = r[0].lower()
+        if sha not in blacklist:
+            sys.stdout.write(f"{sha}\n")
 
 
-def lookup_hash(db_path: str, query_hash: str):
-    """Prints all sibling hashes sharing a group with target SHA (excluding target SHA)."""
-    group_id = resolve_sha_group(db_path, query_hash)
+def lookup_hash(db_path: str, query_hash: str, blacklist: set):
+    """Prints all sibling non-blacklisted hashes sharing a group with target SHA."""
+    group_id = resolve_sha_group(db_path, query_hash, blacklist)
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -129,72 +151,94 @@ def lookup_hash(db_path: str, query_hash: str):
     conn.close()
 
     for r in results:
-        sys.stdout.write(f"{r[0].lower()}\n")
+        sha = r[0].lower()
+        if sha not in blacklist:
+            sys.stdout.write(f"{sha}\n")
 
 
-def smart_lookup(db_path: str, target: str):
+def smart_lookup(db_path: str, target: str, blacklist: set):
     """Automatically detects whether target is a Group ID or commit SHA."""
     clean = target.strip().lstrip("#").lower()
 
     # Explicit group format (e.g., 'g1042')
     if clean.startswith("g") and clean[1:].isdigit():
-        lookup_group(db_path, int(clean[1:]))
+        lookup_group(db_path, int(clean[1:]), blacklist)
         return
 
     # Pure numeric input (e.g., '1042' or '22')
     if clean.isdigit():
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM hashes WHERE group_id = ? LIMIT 1", (int(clean),))
-        group_exists = cur.fetchone() is not None
+        cur.execute("SELECT hex(hash_value) FROM hashes WHERE group_id = ?", (int(clean),))
+        rows = [r[0].lower() for r in cur.fetchall()]
         conn.close()
 
-        if group_exists:
-            lookup_group(db_path, int(clean))
+        valid_rows = [r for r in rows if r not in blacklist]
+        if valid_rows:
+            lookup_group(db_path, int(clean), blacklist)
             return
 
     # Fallback to SHA lookup
-    lookup_hash(db_path, clean)
+    lookup_hash(db_path, clean, blacklist)
 
 
-def show_stats(db_path: str):
-    """Displays key statistics, detection breakdowns, and metrics for the SQLite database."""
+def show_stats(db_path: str, blacklist_path: str, blacklist: set):
+    """Displays statistics excluding blacklisted commit SHAs."""
     if not os.path.exists(db_path):
         sys.stderr.write(f"Error: Database file '{db_path}' not found.\n")
         sys.exit(1)
 
+    where_conditions = []
+    params = []
+
+    if blacklist:
+        placeholders = ",".join("?" for _ in blacklist)
+        where_conditions.append(f"lower(hex(hash_value)) NOT IN ({placeholders})")
+        params.extend(list(blacklist))
+
+    where_clause = " WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM hashes")
+    cur.execute(f"SELECT COUNT(*) FROM hashes {where_clause}", params)
     total_hashes = cur.fetchone()[0]
 
-    cur.execute("SELECT COUNT(DISTINCT group_id) FROM hashes")
+    cur.execute(f"SELECT COUNT(DISTINCT group_id) FROM hashes {where_clause}", params)
     total_groups = cur.fetchone()[0]
 
-    # Detection type breakdown query
-    cur.execute("SELECT detection_type, COUNT(*) FROM hashes GROUP BY detection_type")
+    cur.execute(
+        f"SELECT detection_type, COUNT(*) FROM hashes {where_clause} GROUP BY detection_type",
+        params,
+    )
     type_counts = dict(cur.fetchall())
 
     min_sz, max_sz, avg_sz = (0, 0, 0.0)
     top_groups = []
 
     if total_groups > 0:
-        cur.execute("""
+        cur.execute(
+            f"""
             WITH group_sizes AS (
-                SELECT COUNT(*) AS sz FROM hashes GROUP BY group_id
+                SELECT COUNT(*) AS sz FROM hashes {where_clause} GROUP BY group_id
             )
             SELECT MIN(sz), MAX(sz), AVG(sz) FROM group_sizes
-        """)
+        """,
+            params,
+        )
         min_sz, max_sz, avg_sz = cur.fetchone()
 
-        cur.execute("""
+        cur.execute(
+            f"""
             SELECT group_id, COUNT(*) as cnt
             FROM hashes
+            {where_clause}
             GROUP BY group_id
             ORDER BY cnt DESC
             LIMIT 5
-        """)
+        """,
+            params,
+        )
         top_groups = cur.fetchall()
 
     cur.execute("SELECT value FROM state WHERE key = 'last_commit'")
@@ -208,8 +252,10 @@ def show_stats(db_path: str):
     print("        DATABASE METRICS & STATISTICS        ")
     print("=============================================")
     print(f"Database Path:        {os.path.abspath(db_path)}")
+    print(f"Blacklist Path:       {os.path.abspath(blacklist_path)}")
     print(f"File Size:            {format_size(db_size)}")
     print(f"Last Checkpoint SHA:  {last_commit}")
+    print(f"Blacklisted SHAs:     {len(blacklist):,}")
     print("---------------------------------------------")
     print(f"Total Linked Hashes:  {total_hashes:,}")
     print(f"Total Unique Groups:  {total_groups:,}")
@@ -222,7 +268,6 @@ def show_stats(db_path: str):
             pct = (cnt / total_hashes) * 100.0
             print(f"  - {label:<30}: {cnt:>8,} ({pct:5.1f}%)")
 
-        # Display any unknown/unmapped detection type codes if present
         for dt_code, cnt in type_counts.items():
             if dt_code not in DETECTION_LABELS:
                 pct = (cnt / total_hashes) * 100.0
@@ -259,6 +304,11 @@ if __name__ == "__main__":
         help="Path to the SQLite database file.",
     )
     parser.add_argument(
+        "--blacklist",
+        default=BLACKLIST_NAME,
+        help="Path to the blacklisted SHAs text file.",
+    )
+    parser.add_argument(
         "-g",
         "--group",
         type=int,
@@ -266,16 +316,17 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    blacklist = load_blacklist(args.blacklist)
 
     if args.group is not None:
-        lookup_group(args.db, args.group)
+        lookup_group(args.db, args.group, blacklist)
     elif len(args.targets) == 2:
-        compare_shas(args.db, args.targets[0], args.targets[1])
+        compare_shas(args.db, args.targets[0], args.targets[1], blacklist)
     elif len(args.targets) == 1:
         if args.targets[0] == "stats":
-            show_stats(args.db)
+            show_stats(args.db, args.blacklist, blacklist)
         else:
-            smart_lookup(args.db, args.targets[0])
+            smart_lookup(args.db, args.targets[0], blacklist)
     else:
         parser.print_help(sys.stderr)
         sys.exit(1)
