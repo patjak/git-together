@@ -38,20 +38,20 @@ TRAILER_LINE_RE = re.compile(
 
 
 class DetectionType(IntEnum):
-    CHERRY_PICK = 1
-    SUBJECT_CLEAN_BODY = 2
-    SUBJECT_FUZZY_BODY = 3
-    PATCH_ID_SUBJECT = 4  # Fallback tier for rewritten bodies
-    SUBJECT_AUTHOR_DATE = 5  # High-confidence subject + author timestamp match
+    CHERRY_PICK_TAG = 1            # Matched via explicit '(cherry picked from...)' tag
+    SUBJECT_AND_TIMESTAMP = 2      # Matched via identical subject and author timestamp
+    SUBJECT_AND_MESSAGE = 3        # Matched via identical subject and cleaned message body
+    SUBJECT_AND_FUZZY_MESSAGE = 4  # Matched via identical subject and fuzzy message similarity
+    PATCH_DIFF_MATCH = 5           # Fallback tier: identical code diff (patch-id) + subject
 
 
 # Explicit detection priority order for DB persistence selection
 DETECTION_PRIORITY = (
-    DetectionType.CHERRY_PICK,
-    DetectionType.SUBJECT_AUTHOR_DATE,
-    DetectionType.SUBJECT_CLEAN_BODY,
-    DetectionType.SUBJECT_FUZZY_BODY,
-    DetectionType.PATCH_ID_SUBJECT,
+    DetectionType.CHERRY_PICK_TAG,
+    DetectionType.SUBJECT_AND_TIMESTAMP,
+    DetectionType.SUBJECT_AND_MESSAGE,
+    DetectionType.SUBJECT_AND_FUZZY_MESSAGE,
+    DetectionType.PATCH_DIFF_MATCH,
 )
 
 
@@ -477,12 +477,12 @@ def run_metadata_pass(
                         dsu.union(sha, original_sha)
                         if sha in new_commits_set:
                             tag_match_count += 1
-                        sha_detection[sha].add(DetectionType.CHERRY_PICK)
-                        sha_detection[original_sha].add(DetectionType.CHERRY_PICK)
+                        sha_detection[sha].add(DetectionType.CHERRY_PICK_TAG)
+                        sha_detection[original_sha].add(DetectionType.CHERRY_PICK_TAG)
                         sha_similarity[sha] = max(sha_similarity[sha], 1.0)
                         sha_similarity[original_sha] = max(sha_similarity[original_sha], 1.0)
 
-    print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
+    print(f"  -> Detected {tag_match_count:,} new commits via explicit cherry-pick tags.")
     return sha_to_subject, sha_to_meta, tag_match_count
 
 
@@ -534,8 +534,8 @@ def run_subject_bucket_pass(
 
                 for sha1, sha2 in ad_matches:
                     dsu.union(sha1, sha2)
-                    sha_detection[sha1].add(DetectionType.SUBJECT_AUTHOR_DATE)
-                    sha_detection[sha2].add(DetectionType.SUBJECT_AUTHOR_DATE)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_AND_TIMESTAMP)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_AND_TIMESTAMP)
                     sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
                     sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
@@ -548,8 +548,8 @@ def run_subject_bucket_pass(
 
                 for sha1, sha2 in clean_matches:
                     dsu.union(sha1, sha2)
-                    sha_detection[sha1].add(DetectionType.SUBJECT_CLEAN_BODY)
-                    sha_detection[sha2].add(DetectionType.SUBJECT_CLEAN_BODY)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_AND_MESSAGE)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_AND_MESSAGE)
                     sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
                     sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
@@ -562,8 +562,8 @@ def run_subject_bucket_pass(
 
                 for sha1, sha2, sim in fuzzy_matches:
                     dsu.union(sha1, sha2)
-                    sha_detection[sha1].add(DetectionType.SUBJECT_FUZZY_BODY)
-                    sha_detection[sha2].add(DetectionType.SUBJECT_FUZZY_BODY)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_AND_FUZZY_MESSAGE)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_AND_FUZZY_MESSAGE)
                     sha_similarity[sha1] = max(sha_similarity[sha1], sim)
                     sha_similarity[sha2] = max(sha_similarity[sha2], sim)
 
@@ -634,7 +634,7 @@ def run_patch_id_fallback_pass(
                     dsu.union(first_sha, other_sha)
 
                 for s in shas:
-                    sha_detection[s].add(DetectionType.PATCH_ID_SUBJECT)
+                    sha_detection[s].add(DetectionType.PATCH_DIFF_MATCH)
                     sha_similarity[s] = max(sha_similarity[s], 1.0)
 
                 new_in_group = [s for s in shas if s in new_commits_set]
@@ -642,7 +642,7 @@ def run_patch_id_fallback_pass(
                     patch_group_count += 1
                     patch_commit_count += len(new_in_group)
 
-        print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID fallback.")
+        print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID diff matching.")
 
     return patch_group_count, patch_commit_count
 
@@ -655,11 +655,11 @@ def print_detection_summary(
 ):
     """Print the final run summary metrics."""
     print("\n--- Detection Summary (Current Run Only) ---")
-    print(f"  Explicit Tags Found     : {tag_match_count:,} commits")
-    print(f"  Subject+Author Date Match: {bucket_stats['ad_commits']:,} commits ({bucket_stats['ad_groups']:,} groups)")
-    print(f"  Subject+Clean Body Match: {bucket_stats['clean_commits']:,} commits ({bucket_stats['clean_groups']:,} groups)")
-    print(f"  Subject+Fuzzy Body Match: {bucket_stats['fuzzy_commits']:,} commits ({bucket_stats['fuzzy_groups']:,} groups)")
-    print(f"  Patch-ID Fallback Match : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
+    print(f"  Cherry-Pick Tags         : {tag_match_count:,} commits")
+    print(f"  Subject & Timestamp      : {bucket_stats['ad_commits']:,} commits ({bucket_stats['ad_groups']:,} groups)")
+    print(f"  Subject & Message        : {bucket_stats['clean_commits']:,} commits ({bucket_stats['clean_groups']:,} groups)")
+    print(f"  Subject & Fuzzy Message  : {bucket_stats['fuzzy_commits']:,} commits ({bucket_stats['fuzzy_groups']:,} groups)")
+    print(f"  Patch Diff (Patch-ID)    : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
     print("--------------------------------------------\n")
 
 
@@ -702,7 +702,7 @@ def save_results_to_db(
                         types = sha_detection.get(sha, set())
                         dt_val = next(
                             (t for t in DETECTION_PRIORITY if t in types),
-                            DetectionType.CHERRY_PICK,
+                            DetectionType.CHERRY_PICK_TAG,
                         )
                         sim_val = sha_similarity.get(sha, 1.0)
                         db_records.append((b_sha, target_gid, dt_val.value, sim_val))

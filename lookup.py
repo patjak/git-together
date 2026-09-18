@@ -9,10 +9,10 @@ DB_NAME = "git-together.db"
 
 DETECTION_LABELS = {
     1: "Explicit Cherry-Pick Tag",
-    2: "Subject + Clean Body Match",
-    3: "Subject + Fuzzy Body Match",
-    4: "Patch-ID + Subject Fallback",
-    5: "Subject + Author Date Match",
+    2: "Subject & Timestamp Match",
+    3: "Subject & Message Match",
+    4: "Subject & Fuzzy Message Match",
+    5: "Patch Diff (Patch-ID) Match",
 }
 
 EXAMPLES_TEXT = """examples:
@@ -220,13 +220,13 @@ def show_stats(db_path: str):
         for dt_code, label in DETECTION_LABELS.items():
             cnt = type_counts.get(dt_code, 0)
             pct = (cnt / total_hashes) * 100.0
-            print(f"  - {label:<27}: {cnt:>8,} ({pct:5.1f}%)")
+            print(f"  - {label:<30}: {cnt:>8,} ({pct:5.1f}%)")
 
         # Display any unknown/unmapped detection type codes if present
         for dt_code, cnt in type_counts.items():
             if dt_code not in DETECTION_LABELS:
                 pct = (cnt / total_hashes) * 100.0
-                print(f"  - Unknown Type #{dt_code:<15}: {cnt:>8,} ({pct:5.1f}%)")
+                print(f"  - Unknown Type #{dt_code:<18}: {cnt:>8,} ({pct:5.1f}%)")
     else:
         print("  (No entry records in database)")
 

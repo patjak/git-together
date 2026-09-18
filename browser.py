@@ -13,11 +13,11 @@ from textual.widgets import Footer, Header, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 DETECTION_NAMES = {
-    1: "CHERRY_PICK",
-    2: "CLEAN_BODY",
-    3: "FUZZY_BODY",
-    4: "PATCH_ID",
-    5: "AUTHOR_DATE",
+    1: "CHERRY_PICK_TAG",
+    2: "SUBJECT_AND_TIMESTAMP",
+    3: "SUBJECT_AND_MESSAGE",
+    4: "SUBJECT_AND_FUZZY_MESSAGE",
+    5: "PATCH_DIFF_MATCH",
 }
 
 
