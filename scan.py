@@ -307,7 +307,7 @@ class Workers:
                 for j in range(i + 1, n):
                     c2 = commits[j]
 
-                    # Enforce file overlap check to eliminate false positives on identical subjects across different files
+                    # Enforce file overlap check
                     if c1.files and c2.files and not (c1.files & c2.files):
                         continue
 
@@ -321,7 +321,15 @@ class Workers:
                     is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
                     is_meaningful_body = len(c1.cleaned_body) > 30 and len(c2.cleaned_body) > 30
 
-                    if is_author_date_match:
+                    # Evaluate body similarity for timestamp matches to prevent batch/scripted commit false positives
+                    body_sim = 1.0
+                    if c1.cleaned_body and c2.cleaned_body:
+                        body_sim = compute_similarity(c1.cleaned_body, c2.cleaned_body)
+                    elif bool(c1.cleaned_body) != bool(c2.cleaned_body):
+                        body_sim = 0.0
+
+                    # Require body similarity threshold (>= 0.75) even when author timestamps match
+                    if is_author_date_match and body_sim >= 0.75:
                         author_date_matches.append((c1.sha, c2.sha))
                         matched_in_bucket.add(c1.sha)
                         matched_in_bucket.add(c2.sha)
