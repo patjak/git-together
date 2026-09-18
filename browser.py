@@ -17,6 +17,7 @@ DETECTION_NAMES = {
     2: "CLEAN_BODY",
     3: "FUZZY_BODY",
     4: "PATCH_ID",
+    5: "AUTHOR_DATE",
 }
 
 
