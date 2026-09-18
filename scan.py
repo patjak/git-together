@@ -23,7 +23,7 @@ except ImportError:
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
-BUCKET_CHUNK_SIZE = 20  # Reduced chunk size for granular worker load-balancing
+BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
 MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
 TRAILER_LINE_RE = re.compile(
     r"^[A-Za-z0-9-]+:\s+.*$|^[A-Za-z0-9-]+\s+#\d+.*$", re.IGNORECASE
@@ -32,15 +32,14 @@ TRAILER_LINE_RE = re.compile(
 
 class DetectionType(IntEnum):
     CHERRY_PICK = 1
-    PATCH_ID_SUBJECT = 2
-    SUBJECT_CLEAN_BODY = 3
-    SUBJECT_FUZZY_BODY = 4
+    SUBJECT_CLEAN_BODY = 2
+    SUBJECT_FUZZY_BODY = 3
+    PATCH_ID_SUBJECT = 4  # Fallback tier for rewritten bodies
 
 
 def strip_trailers_and_normalize(body: str) -> str:
     lines = body.strip().splitlines()
 
-    # Walk backward from the end to remove the bottom trailer block
     idx = len(lines) - 1
     while idx >= 0:
         line = lines[idx].strip()
@@ -57,7 +56,6 @@ def strip_trailers_and_normalize(body: str) -> str:
 
 
 def compute_similarity(s1: str, s2: str) -> float:
-    """Calculates string similarity using rapidfuzz (if available) or difflib fallback."""
     if HAS_RAPIDFUZZ:
         return fuzz.ratio(s1, s2) / 100.0
     return difflib.SequenceMatcher(None, s1, s2).ratio()
@@ -147,7 +145,6 @@ def get_last_processed_commit(conn: sqlite3.Connection, repo_path: str) -> Optio
 
 
 def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
-    """Returns an ordered list of full 40-character commit SHAs."""
     try:
         out = run_git(
             ["git", "rev-list", "--reverse", "--no-abbrev-commit", rev_spec],
@@ -158,8 +155,97 @@ def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
         return []
 
 
-def process_patch_id_chunk(args: Tuple[str, List[str]]) -> Tuple[List[Tuple[str, str]], dict]:
-    """Worker function: Computes patch IDs, subjects, and cleaned bodies for a chunk of SHAs."""
+def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
+    """Worker function: Stream subject and body metadata for a chunk of SHAs."""
+    repo_path, shas = args
+    input_shas = "\n".join(shas) + "\n"
+
+    sha_to_info = {}
+    cmd = [
+        "git",
+        "--no-pager",
+        "log",
+        "-z",
+        "--ignore-missing",
+        "--no-walk",
+        "--stdin",
+        "--format=%H%n%s%n%b",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        bufsize=1024 * 1024,
+    )
+    try:
+        proc.stdin.write(input_shas.encode("utf-8"))
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+
+    buffer = bytearray()
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while b"\x00" in buffer:
+            pos = buffer.index(b"\x00")
+            record = buffer[:pos].decode("utf-8", errors="replace")
+            del buffer[: pos + 1]
+            if record:
+                parts = record.split("\n", 2)
+                if len(parts) >= 1 and len(parts[0].strip()) == 40:
+                    sha = parts[0].strip().lower()
+                    subject = parts[1].strip() if len(parts) > 1 else ""
+                    body = parts[2] if len(parts) > 2 else ""
+                    cleaned_body = strip_trailers_and_normalize(body)
+                    sha_to_info[sha] = (subject, body, cleaned_body)
+
+    proc.stdout.close()
+    proc.wait()
+    return sha_to_info
+
+
+def process_subject_bucket_chunk(
+    chunk_buckets: List[List[Tuple[str, str]]]
+) -> Tuple[int, List[List[str]], List[Tuple[str, str]]]:
+    clean_matches = []
+    fuzzy_matches = []
+
+    for sha_tuples in chunk_buckets:
+        body_to_shas = defaultdict(list)
+        for sha, cb in sha_tuples:
+            if cb:
+                body_to_shas[cb].append(sha)
+
+        matched_in_subject = set()
+        for cb, group_shas in body_to_shas.items():
+            if len(group_shas) > 1:
+                clean_matches.append(group_shas)
+                matched_in_subject.update(group_shas)
+
+        unmatched = [
+            (sha, cb) for sha, cb in sha_tuples if sha not in matched_in_subject and cb
+        ]
+
+        if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
+            for i in range(len(unmatched)):
+                sha1, cb1 = unmatched[i]
+                for j in range(i + 1, len(unmatched)):
+                    sha2, cb2 = unmatched[j]
+                    len1, len2 = len(cb1), len(cb2)
+                    if min(len1, len2) / max(len1, len2) < 0.70:
+                        continue
+                    if compute_similarity(cb1, cb2) >= 0.85:
+                        fuzzy_matches.append((sha1, sha2))
+
+    return len(chunk_buckets), clean_matches, fuzzy_matches
+
+
+def process_fallback_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[str, str]]:
+    """Worker function: Compute patch IDs ONLY for remaining fallback candidate SHAs."""
     repo_path, shas = args
     input_shas = "\n".join(shas) + "\n"
 
@@ -201,150 +287,18 @@ def process_patch_id_chunk(args: Tuple[str, List[str]]) -> Tuple[List[Tuple[str,
     except BrokenPipeError:
         pass
 
-    raw_patch_results = []
+    results = []
     for line in patch_proc.stdout:
         parts = line.strip().split()
         if len(parts) == 2:
             patch_id, sha = parts[0], parts[1].lower()
             if len(sha) == 40:
-                raw_patch_results.append((patch_id, sha))
+                results.append((patch_id, sha))
 
     patch_proc.stdout.close()
     patch_proc.wait()
     log_proc.wait()
-
-    # Retrieve subject lines and commit bodies using NUL-delimited binary format
-    sha_to_info = {}
-    subject_cmd = [
-        "git",
-        "--no-pager",
-        "log",
-        "-z",
-        "--ignore-missing",
-        "--no-walk",
-        "--stdin",
-        "--format=%H%n%s%n%b",
-    ]
-    subj_proc = subprocess.Popen(
-        subject_cmd,
-        cwd=repo_path,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        bufsize=1024 * 1024,
-    )
-    try:
-        subj_proc.stdin.write(input_shas.encode("utf-8"))
-        subj_proc.stdin.close()
-    except BrokenPipeError:
-        pass
-
-    buffer = bytearray()
-    while True:
-        chunk = subj_proc.stdout.read(65536)
-        if not chunk:
-            break
-        buffer.extend(chunk)
-        while b"\x00" in buffer:
-            pos = buffer.index(b"\x00")
-            record = buffer[:pos].decode("utf-8", errors="replace")
-            del buffer[: pos + 1]
-            if record:
-                parts = record.split("\n", 2)
-                if len(parts) >= 1 and len(parts[0].strip()) == 40:
-                    sha = parts[0].strip().lower()
-                    subject = parts[1].strip() if len(parts) > 1 else ""
-                    body = parts[2] if len(parts) > 2 else ""
-                    cleaned_body = strip_trailers_and_normalize(body)
-                    sha_to_info[sha] = (subject, cleaned_body)
-
-    subj_proc.stdout.close()
-    subj_proc.wait()
-
-    return raw_patch_results, sha_to_info
-
-
-def process_subject_bucket_chunk(
-    chunk_buckets: List[List[Tuple[str, str]]]
-) -> Tuple[int, List[List[str]], List[Tuple[str, str]]]:
-    """Worker function: Evaluates subject buckets in parallel for clean and fuzzy body matches."""
-    clean_matches = []
-    fuzzy_matches = []
-
-    for sha_tuples in chunk_buckets:
-        body_to_shas = defaultdict(list)
-        for sha, cb in sha_tuples:
-            if cb:
-                body_to_shas[cb].append(sha)
-
-        matched_in_subject = set()
-        for cb, group_shas in body_to_shas.items():
-            if len(group_shas) > 1:
-                clean_matches.append(group_shas)
-                matched_in_subject.update(group_shas)
-
-        unmatched = [
-            (sha, cb) for sha, cb in sha_tuples if sha not in matched_in_subject and cb
-        ]
-
-        # Cap O(N^2) fuzzy matching pass on generic subjects with large numbers of distinct bodies
-        if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
-            for i in range(len(unmatched)):
-                sha1, cb1 = unmatched[i]
-                for j in range(i + 1, len(unmatched)):
-                    sha2, cb2 = unmatched[j]
-                    len1, len2 = len(cb1), len(cb2)
-                    if min(len1, len2) / max(len1, len2) < 0.70:
-                        continue
-                    if compute_similarity(cb1, cb2) >= 0.85:
-                        fuzzy_matches.append((sha1, sha2))
-
-    return len(chunk_buckets), clean_matches, fuzzy_matches
-
-
-def stream_commit_messages(repo_path: str, rev_spec: str):
-    """Streams commit hashes and message bodies using binary-safe NUL (-z) delimiters."""
-    cmd = [
-        "git",
-        "--no-pager",
-        "log",
-        "-z",
-        "--reverse",
-        "--no-abbrev-commit",
-        "--format=%H%n%B",
-        rev_spec,
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_path,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1024 * 1024,
-    )
-
-    buffer = bytearray()
-    while True:
-        chunk = proc.stdout.read(65536)
-        if not chunk:
-            break
-        buffer.extend(chunk)
-        while b"\x00" in buffer:
-            pos = buffer.index(b"\x00")
-            record = buffer[:pos].decode("utf-8", errors="replace")
-            del buffer[: pos + 1]
-            if record:
-                parts = record.split("\n", 1)
-                sha = parts[0].strip().lower()
-                body = parts[1] if len(parts) > 1 else ""
-                if len(sha) == 40:
-                    yield sha, body
-
-    proc.stdout.close()
-    stderr_err = proc.stderr.read().decode("utf-8", errors="replace")
-    proc.stderr.close()
-    proc.wait()
-
-    if proc.returncode != 0 and stderr_err.strip():
-        print(f"\nWarning: git log process returned error:\n{stderr_err.strip()}", file=sys.stderr)
+    return results
 
 
 def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
@@ -387,14 +341,14 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     if HAS_RAPIDFUZZ:
         print("Using rapidfuzz (C++ engine) for high-performance fuzzy body matching.")
     else:
-        print("Using difflib fallback for fuzzy body matching (install 'rapidfuzz' for faster scans).")
+        print("Using difflib fallback for fuzzy body matching.")
 
     dsu = DisjointSet()
     existing_sha_to_gid = {}
     gid_to_shas = defaultdict(list)
     sha_detection = defaultdict(set)
 
-    # 1. Load and reconstruct existing database groups in DSU
+    # 1. Load existing database state
     print("Loading existing database state into memory...")
     cur = conn.cursor()
     cur.execute("SELECT hex(hash_value), group_id, detection_type FROM hashes")
@@ -414,103 +368,42 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         for other_sha in shas[1:]:
             dsu.union(first_sha, other_sha)
 
-    # 2. Stream and match commit messages for explicit tags
-    print("Scanning commit messages for explicit cherry-pick tags...")
-    latest_commit = None
-    msg_count = 0
-    tag_match_count = 0
-
-    for sha, body in stream_commit_messages(repo_path, rev_spec):
-        latest_commit = sha
-        msg_count += 1
-        dsu.find(sha)
-
-        match = CHERRY_PICK_RE.search(body)
-        if match:
-            original_sha = match.group(1).lower()
-            if len(original_sha) == 40:
-                dsu.union(sha, original_sha)
-                tag_match_count += 1
-                sha_detection[sha].add(DetectionType.CHERRY_PICK)
-                sha_detection[original_sha].add(DetectionType.CHERRY_PICK)
-
-        if msg_count % 1000 == 0:
-            pct = min((msg_count / total_new_commits) * 100, 100.0)
-            sys.stdout.write(
-                f"\r\033[K  Message Scan: {msg_count:,}/{total_new_commits:,} commits ({pct:.1f}%)"
-            )
-            sys.stdout.flush()
-
-    pct = min((msg_count / total_new_commits) * 100, 100.0)
-    sys.stdout.write(
-        f"\r\033[K  Message Scan: {msg_count:,}/{total_new_commits:,} commits ({pct:.1f}%)\n"
-    )
-    sys.stdout.flush()
-    print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
-
-    # 3. Parallel patch-ID, subject, and cleaned body extraction
     existing_db_shas = list(existing_sha_to_gid.keys())
     shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
 
-    print(
-        f"Calculating patch IDs, subjects, and cleaned bodies for {len(shas_to_scan):,} commits across {num_workers} workers..."
-    )
+    # 2. Fast Metadata Pass (Subject, Full Body, Cleaned Body)
+    print(f"Fetching metadata for {len(shas_to_scan):,} commits...")
     chunks = [
         (repo_path, shas_to_scan[i : i + CHUNK_SIZE])
         for i in range(0, len(shas_to_scan), CHUNK_SIZE)
     ]
 
-    patch_to_shas = defaultdict(list)
     sha_to_subject = {}
     sha_to_cleaned_body = {}
-    processed_patches = 0
-    total_scan_count = len(shas_to_scan)
+    latest_commit = new_commits[-1] if new_commits else None
+    tag_match_count = 0
 
     with multiprocessing.Pool(processes=num_workers) as pool:
-        for raw_patch_results, sha_to_info in pool.imap_unordered(
-            process_patch_id_chunk, chunks
-        ):
-            for patch_id, sha in raw_patch_results:
-                subj = sha_to_info.get(sha, ("", ""))[0]
-                patch_to_shas[(patch_id, subj)].append(sha)
-                processed_patches += 1
+        for chunk_info in pool.imap_unordered(fetch_commit_metadata_chunk, chunks):
+            for sha, (subj, body, cb) in chunk_info.items():
+                sha_to_subject[sha] = subj
+                sha_to_cleaned_body[sha] = cb
+                dsu.find(sha)
 
-            for sha, (subj, cb) in sha_to_info.items():
-                if subj:
-                    sha_to_subject[sha] = subj
-                    sha_to_cleaned_body[sha] = cb
+                # Pass 1: Explicit Cherry-Pick Tags
+                match = CHERRY_PICK_RE.search(body)
+                if match:
+                    original_sha = match.group(1).lower()
+                    if len(original_sha) == 40:
+                        dsu.union(sha, original_sha)
+                        if sha in new_commits_set:
+                            tag_match_count += 1
+                        sha_detection[sha].add(DetectionType.CHERRY_PICK)
+                        sha_detection[original_sha].add(DetectionType.CHERRY_PICK)
 
-            pct = min((processed_patches / total_scan_count) * 100, 100.0)
-            sys.stdout.write(
-                f"\r\033[K  Patch-ID & Body Scan: {processed_patches:,}/{total_scan_count:,} patches processed ({pct:.1f}%)"
-            )
-            sys.stdout.flush()
+    print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
 
-    sys.stdout.write(
-        f"\r\033[K  Patch-ID & Body Scan: {processed_patches:,}/{total_scan_count:,} patches processed ({pct:.1f}%)\n"
-    )
-    sys.stdout.flush()
-
-    # Pass 1: Group commits sharing identical patch-ids and commit subjects
-    print("Grouping identical patches with matching subjects...")
-    patch_group_count = 0
-    patch_commit_count = 0
-
-    for (patch_id, subject), shas in patch_to_shas.items():
-        if len(shas) > 1:
-            first_sha = shas[0]
-            for other_sha in shas[1:]:
-                dsu.union(first_sha, other_sha)
-
-            for s in shas:
-                sha_detection[s].add(DetectionType.PATCH_ID_SUBJECT)
-
-            new_in_group = [s for s in shas if s in new_commits_set]
-            if new_in_group:
-                patch_group_count += 1
-                patch_commit_count += len(new_in_group)
-
-    # Pass 2 & 3: Parallel evaluation of subject buckets for Clean Body & Fuzzy Body matching
+    # 3. Pass 2 & 3: Subject Bucket evaluation (Clean Body & Fuzzy Body)
     subject_to_shas = defaultdict(list)
     for sha, subj in sha_to_subject.items():
         if subj:
@@ -521,8 +414,6 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         for shas in subject_to_shas.values()
         if len(shas) >= 2
     ]
-
-    # Sort candidate buckets by size descending (Longest Processing Time First)
     candidate_buckets.sort(key=len, reverse=True)
 
     clean_body_group_count = 0
@@ -532,7 +423,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     if candidate_buckets:
         print(
-            f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers (sorted heaviest first)..."
+            f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers..."
         )
         bucket_chunks = [
             candidate_buckets[i : i + BUCKET_CHUNK_SIZE]
@@ -584,14 +475,59 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         )
         sys.stdout.flush()
 
+    # 4. Pass 4: Targeted Patch-ID Fallback for remaining unmatched commits in candidate buckets
+    fallback_shas = set()
+    for subj, shas in subject_to_shas.items():
+        if len(shas) >= 2:
+            # Gather commits in this bucket that are not yet grouped with all other bucket members
+            roots = {dsu.find(s) for s in shas}
+            if len(roots) > 1:
+                fallback_shas.update(shas)
+
+    patch_group_count = 0
+    patch_commit_count = 0
+
+    if fallback_shas:
+        fallback_list = list(fallback_shas)
+        print(
+            f"Running targeted patch-ID fallback on {len(fallback_list):,} remaining unmatched candidate commits..."
+        )
+        fb_chunks = [
+            (repo_path, fallback_list[i : i + CHUNK_SIZE])
+            for i in range(0, len(fallback_list), CHUNK_SIZE)
+        ]
+
+        patch_to_shas = defaultdict(list)
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            for chunk_results in pool.imap_unordered(process_fallback_patch_id_chunk, fb_chunks):
+                for patch_id, sha in chunk_results:
+                    subj = sha_to_subject.get(sha, "")
+                    patch_to_shas[(patch_id, subj)].append(sha)
+
+        for (patch_id, subject), shas in patch_to_shas.items():
+            if len(shas) > 1:
+                first_sha = shas[0]
+                for other_sha in shas[1:]:
+                    dsu.union(first_sha, other_sha)
+
+                for s in shas:
+                    sha_detection[s].add(DetectionType.PATCH_ID_SUBJECT)
+
+                new_in_group = [s for s in shas if s in new_commits_set]
+                if new_in_group:
+                    patch_group_count += 1
+                    patch_commit_count += len(new_in_group)
+
+        print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID fallback.")
+
     print("\n--- Detection Summary (Current Run Only) ---")
     print(f"  Explicit Tags Found     : {tag_match_count:,} commits")
-    print(f"  Patch-ID+Subject Match  : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
     print(f"  Subject+Clean Body Match: {clean_body_commit_count:,} commits ({clean_body_group_count:,} groups)")
     print(f"  Subject+Fuzzy Body Match: {fuzzy_body_commit_count:,} commits ({fuzzy_body_group_count:,} groups)")
+    print(f"  Patch-ID Fallback Match : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
     print("--------------------------------------------\n")
 
-    # 4. Resolve group IDs and bulk write to SQLite with prioritized detection types
+    # 5. Write results to SQLite
     print("Writing groups to SQLite...")
     root_to_members = defaultdict(list)
     for sha in dsu.parent:
@@ -622,12 +558,12 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                         types = sha_detection.get(sha, set())
                         if DetectionType.CHERRY_PICK in types:
                             dt_val = DetectionType.CHERRY_PICK
-                        elif DetectionType.PATCH_ID_SUBJECT in types:
-                            dt_val = DetectionType.PATCH_ID_SUBJECT
                         elif DetectionType.SUBJECT_CLEAN_BODY in types:
                             dt_val = DetectionType.SUBJECT_CLEAN_BODY
                         elif DetectionType.SUBJECT_FUZZY_BODY in types:
                             dt_val = DetectionType.SUBJECT_FUZZY_BODY
+                        elif DetectionType.PATCH_ID_SUBJECT in types:
+                            dt_val = DetectionType.PATCH_ID_SUBJECT
                         else:
                             dt_val = DetectionType.CHERRY_PICK
 
