@@ -157,7 +157,7 @@ def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
 
 
 def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
-    """Worker function: Stream subject and body metadata for a chunk of SHAs."""
+    """Worker function: Stream author, dates, subject and body metadata for a chunk of SHAs."""
     repo_path, shas = args
     input_shas = "\n".join(shas) + "\n"
 
@@ -171,7 +171,7 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
         "--no-walk",
         "--no-merges",
         "--stdin",
-        "--format=%H%n%s%n%b",
+        "--format=%H%n%an%n%at%n%ct%n%s%n%b",
     ]
     proc = subprocess.Popen(
         cmd,
@@ -197,13 +197,29 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
             record = buffer[:pos].decode("utf-8", errors="replace")
             del buffer[: pos + 1]
             if record:
-                parts = record.split("\n", 2)
-                if len(parts) >= 1 and len(parts[0].strip()) == 40:
+                parts = record.split("\n", 5)
+                if len(parts) >= 5 and len(parts[0].strip()) == 40:
                     sha = parts[0].strip().lower()
-                    subject = parts[1].strip() if len(parts) > 1 else ""
-                    body = parts[2] if len(parts) > 2 else ""
+                    author_name = parts[1].strip()
+                    try:
+                        author_date = int(parts[2].strip())
+                    except ValueError:
+                        author_date = 0
+                    try:
+                        committer_date = int(parts[3].strip())
+                    except ValueError:
+                        committer_date = 0
+                    subject = parts[4].strip()
+                    body = parts[5] if len(parts) > 5 else ""
                     cleaned_body = strip_trailers_and_normalize(body)
-                    sha_to_info[sha] = (subject, body, cleaned_body)
+                    sha_to_info[sha] = (
+                        author_name,
+                        author_date,
+                        committer_date,
+                        subject,
+                        body,
+                        cleaned_body,
+                    )
 
     proc.stdout.close()
     proc.wait()
@@ -211,37 +227,64 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
 
 
 def process_subject_bucket_chunk(
-    chunk_buckets: List[List[Tuple[str, str]]]
-) -> Tuple[int, List[List[str]], List[Tuple[str, str, float]]]:
+    chunk_buckets: List[List[Tuple[str, str, int, int, str]]]
+) -> Tuple[int, List[Tuple[str, str]], List[Tuple[str, str, float]]]:
     clean_matches = []
     fuzzy_matches = []
 
     for sha_tuples in chunk_buckets:
-        body_to_shas = defaultdict(list)
-        for sha, cb in sha_tuples:
-            if cb:
-                body_to_shas[cb].append(sha)
+        n = len(sha_tuples)
+        matched_in_bucket = set()
 
-        matched_in_subject = set()
-        for cb, group_shas in body_to_shas.items():
-            if len(group_shas) > 1:
-                clean_matches.append(group_shas)
-                matched_in_subject.update(group_shas)
+        # 1. Author Date & Clean Body verification
+        for i in range(n):
+            sha1, an1, ad1, cd1, cb1 = sha_tuples[i]
+            for j in range(i + 1, n):
+                sha2, an2, ad2, cd2, cb2 = sha_tuples[j]
 
+                # Case A: Same Author Date -> Definite Cherry-Pick
+                is_author_date_match = ad1 > 0 and ad1 == ad2
+
+                # Case B: Clean Body Match with author/date sanity checks
+                is_clean_body_match = False
+                if cb1 and cb2 and cb1 == cb2:
+                    authors_same = an1.lower() == an2.lower()
+                    time_diff_days = abs(ad1 - ad2) / 86400.0 if (ad1 and ad2) else 0
+
+                    # Reject matching bodies if authors differ AND commits are > 1 year apart
+                    if authors_same or time_diff_days <= 365:
+                        is_clean_body_match = True
+
+                if is_author_date_match or is_clean_body_match:
+                    clean_matches.append((sha1, sha2))
+                    matched_in_bucket.add(sha1)
+                    matched_in_bucket.add(sha2)
+
+        # 2. Fuzzy Body matching for remaining unmatched bucket items
         unmatched = [
-            (sha, cb) for sha, cb in sha_tuples if sha not in matched_in_subject and cb
+            t for t in sha_tuples if t[0] not in matched_in_bucket and t[4]
         ]
 
         if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
             for i in range(len(unmatched)):
-                sha1, cb1 = unmatched[i]
+                sha1, an1, ad1, cd1, cb1 = unmatched[i]
                 for j in range(i + 1, len(unmatched)):
-                    sha2, cb2 = unmatched[j]
+                    sha2, an2, ad2, cd2, cb2 = unmatched[j]
+
+                    authors_same = an1.lower() == an2.lower()
+                    time_diff_days = abs(ad1 - ad2) / 86400.0 if (ad1 and ad2) else 0
+
+                    # Require author match OR timestamp proximity (<= 180 days)
+                    if not authors_same and time_diff_days > 180:
+                        continue
+
                     len1, len2 = len(cb1), len(cb2)
                     if min(len1, len2) / max(len1, len2) < 0.70:
                         continue
+
                     sim = compute_similarity(cb1, cb2)
-                    if sim >= 0.85:
+                    required_sim = 0.85 if authors_same else 0.90
+                    if sim >= required_sim:
                         fuzzy_matches.append((sha1, sha2, sim))
 
     return len(chunk_buckets), clean_matches, fuzzy_matches
@@ -378,7 +421,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     existing_db_shas = list(existing_sha_to_gid.keys())
     shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
 
-    # 2. Fast Metadata Pass (Subject, Full Body, Cleaned Body)
+    # 2. Fast Metadata Pass (Author, Dates, Subject, Full Body, Cleaned Body)
     print(f"Fetching metadata for {len(shas_to_scan):,} commits...")
     chunks = [
         (repo_path, shas_to_scan[i : i + CHUNK_SIZE])
@@ -386,15 +429,15 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     ]
 
     sha_to_subject = {}
-    sha_to_cleaned_body = {}
+    sha_to_meta = {}  # sha -> (author_name, author_date, committer_date, cleaned_body)
     latest_commit = new_commits[-1] if new_commits else None
     tag_match_count = 0
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         for chunk_info in pool.imap_unordered(fetch_commit_metadata_chunk, chunks):
-            for sha, (subj, body, cb) in chunk_info.items():
+            for sha, (an, ad, cd, subj, body, cb) in chunk_info.items():
                 sha_to_subject[sha] = subj
-                sha_to_cleaned_body[sha] = cb
+                sha_to_meta[sha] = (an, ad, cd, cb)
                 dsu.find(sha)
 
                 # Pass 1: Explicit Cherry-Pick Tags
@@ -412,14 +455,18 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
 
-    # 3. Pass 2 & 3: Subject Bucket evaluation (Clean Body & Fuzzy Body)
+    # 3. Pass 2 & 3: Subject Bucket evaluation (Author Date, Clean Body & Fuzzy Body)
     subject_to_shas = defaultdict(list)
     for sha, subj in sha_to_subject.items():
         if subj:
             subject_to_shas[subj].append(sha)
 
     candidate_buckets = [
-        [(s, sha_to_cleaned_body.get(s, "")) for s in shas]
+        [
+            (s, sha_to_meta[s][0], sha_to_meta[s][1], sha_to_meta[s][2], sha_to_meta[s][3])
+            for s in shas
+            if s in sha_to_meta
+        ]
         for shas in subject_to_shas.values()
         if len(shas) >= 2
     ]
@@ -448,19 +495,19 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
             ):
                 processed_buckets += count
 
-                for group_shas in clean_matches:
-                    first_sha = group_shas[0]
-                    for other_sha in group_shas[1:]:
-                        dsu.union(first_sha, other_sha)
+                for sha1, sha2 in clean_matches:
+                    dsu.union(sha1, sha2)
+                    sha_detection[sha1].add(DetectionType.SUBJECT_CLEAN_BODY)
+                    sha_detection[sha2].add(DetectionType.SUBJECT_CLEAN_BODY)
+                    sha_similarity[sha1] = max(sha_similarity[sha1], 1.0)
+                    sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
-                    for s in group_shas:
-                        sha_detection[s].add(DetectionType.SUBJECT_CLEAN_BODY)
-                        sha_similarity[s] = max(sha_similarity[s], 1.0)
-
-                    new_in_group = [s for s in group_shas if s in new_commits_set]
-                    if new_in_group:
+                    if sha1 in new_commits_set or sha2 in new_commits_set:
                         clean_body_group_count += 1
-                        clean_body_commit_count += len(new_in_group)
+                        if sha1 in new_commits_set:
+                            clean_body_commit_count += 1
+                        if sha2 in new_commits_set:
+                            clean_body_commit_count += 1
 
                 for sha1, sha2, sim in fuzzy_matches:
                     dsu.union(sha1, sha2)
@@ -491,7 +538,6 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     fallback_shas = set()
     for subj, shas in subject_to_shas.items():
         if len(shas) >= 2:
-            # Gather commits in this bucket that are not yet grouped with all other bucket members
             roots = {dsu.find(s) for s in shas}
             if len(roots) > 1:
                 fallback_shas.update(shas)
