@@ -110,7 +110,8 @@ def init_db(conn: sqlite3.Connection):
             CREATE TABLE IF NOT EXISTS hashes (
                 hash_value BLOB NOT NULL PRIMARY KEY CHECK(length(hash_value) = 20),
                 group_id INTEGER NOT NULL,
-                detection_type INTEGER NOT NULL
+                detection_type INTEGER NOT NULL,
+                similarity REAL
             ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS idx_hashes_group ON hashes(group_id);
@@ -211,7 +212,7 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
 
 def process_subject_bucket_chunk(
     chunk_buckets: List[List[Tuple[str, str]]]
-) -> Tuple[int, List[List[str]], List[Tuple[str, str]]]:
+) -> Tuple[int, List[List[str]], List[Tuple[str, str, float]]]:
     clean_matches = []
     fuzzy_matches = []
 
@@ -239,8 +240,9 @@ def process_subject_bucket_chunk(
                     len1, len2 = len(cb1), len(cb2)
                     if min(len1, len2) / max(len1, len2) < 0.70:
                         continue
-                    if compute_similarity(cb1, cb2) >= 0.85:
-                        fuzzy_matches.append((sha1, sha2))
+                    sim = compute_similarity(cb1, cb2)
+                    if sim >= 0.85:
+                        fuzzy_matches.append((sha1, sha2, sim))
 
     return len(chunk_buckets), clean_matches, fuzzy_matches
 
@@ -349,16 +351,19 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     existing_sha_to_gid = {}
     gid_to_shas = defaultdict(list)
     sha_detection = defaultdict(set)
+    sha_similarity = defaultdict(float)
 
     # 1. Load existing database state
     print("Loading existing database state into memory...")
     cur = conn.cursor()
-    cur.execute("SELECT hex(hash_value), group_id, detection_type FROM hashes")
-    for sha_hex, gid, dt_int in cur.fetchall():
+    cur.execute("SELECT hex(hash_value), group_id, detection_type, similarity FROM hashes")
+    for sha_hex, gid, dt_int, sim in cur.fetchall():
         sha_lower = sha_hex.lower()
         if len(sha_lower) == 40:
             existing_sha_to_gid[sha_lower] = gid
             gid_to_shas[gid].append(sha_lower)
+            if sim is not None:
+                sha_similarity[sha_lower] = float(sim)
             if dt_int is not None:
                 try:
                     sha_detection[sha_lower].add(DetectionType(dt_int))
@@ -402,6 +407,8 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                             tag_match_count += 1
                         sha_detection[sha].add(DetectionType.CHERRY_PICK)
                         sha_detection[original_sha].add(DetectionType.CHERRY_PICK)
+                        sha_similarity[sha] = max(sha_similarity[sha], 1.0)
+                        sha_similarity[original_sha] = max(sha_similarity[original_sha], 1.0)
 
     print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
 
@@ -448,16 +455,19 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
                     for s in group_shas:
                         sha_detection[s].add(DetectionType.SUBJECT_CLEAN_BODY)
+                        sha_similarity[s] = max(sha_similarity[s], 1.0)
 
                     new_in_group = [s for s in group_shas if s in new_commits_set]
                     if new_in_group:
                         clean_body_group_count += 1
                         clean_body_commit_count += len(new_in_group)
 
-                for sha1, sha2 in fuzzy_matches:
+                for sha1, sha2, sim in fuzzy_matches:
                     dsu.union(sha1, sha2)
                     sha_detection[sha1].add(DetectionType.SUBJECT_FUZZY_BODY)
                     sha_detection[sha2].add(DetectionType.SUBJECT_FUZZY_BODY)
+                    sha_similarity[sha1] = max(sha_similarity[sha1], sim)
+                    sha_similarity[sha2] = max(sha_similarity[sha2], sim)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
                         fuzzy_body_group_count += 1
@@ -514,6 +524,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
                 for s in shas:
                     sha_detection[s].add(DetectionType.PATCH_ID_SUBJECT)
+                    sha_similarity[s] = max(sha_similarity[s], 1.0)
 
                 new_in_group = [s for s in shas if s in new_commits_set]
                 if new_in_group:
@@ -569,13 +580,14 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                         else:
                             dt_val = DetectionType.CHERRY_PICK
 
-                        db_records.append((b_sha, target_gid, dt_val.value))
+                        sim_val = sha_similarity.get(sha, 1.0)
+                        db_records.append((b_sha, target_gid, dt_val.value, sim_val))
                 except ValueError:
                     continue
 
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO hashes (hash_value, group_id, detection_type) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO hashes (hash_value, group_id, detection_type, similarity) VALUES (?, ?, ?, ?)",
             db_records,
         )
         if latest_commit and len(latest_commit) == 40:
