@@ -27,6 +27,7 @@ CHUNK_SIZE = 2000  # Default commit chunk size
 BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
 MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
 MAX_MAINLINE_CYCLE_GAP = 75 * 86400  # Hard 75-day max gap (~1 kernel release cycle)
+MIN_SIMILARITY_THRESHOLD = 0.75  # Minimum file change similarity threshold
 
 TRAILER_LINE_RE = re.compile(
     r"^[A-Za-z0-9-]+:\s+.*$"                             # Key: Value (Signed-off-by, Cc, Fixes, Link, etc.)
@@ -893,8 +894,9 @@ def save_results_to_db(
     sha_detection: defaultdict,
     sha_similarity: defaultdict,
     latest_commit: Optional[str],
+    min_similarity: float = MIN_SIMILARITY_THRESHOLD,
 ):
-    """Persist final group assignments and commit checkpoints to SQLite."""
+    """Persist final group assignments and commit checkpoints to SQLite, filtering out SHAs below min_similarity."""
     print("Writing groups to SQLite...")
     root_to_members = defaultdict(list)
     for sha in dsu.parent:
@@ -905,19 +907,27 @@ def save_results_to_db(
     next_gid = max_gid + 1
 
     db_records = []
+    filtered_shas_count = 0
+
     for root, members in root_to_members.items():
+        # Filter members whose similarity score is below the threshold
+        filtered_members = [
+            m for m in members if sha_similarity.get(m, 1.0) >= min_similarity
+        ]
+        filtered_shas_count += len(members) - len(filtered_members)
+
         existing_gids = {
-            existing_sha_to_gid[m] for m in members if m in existing_sha_to_gid
+            existing_sha_to_gid[m] for m in filtered_members if m in existing_sha_to_gid
         }
 
-        if len(members) < 2 and not existing_gids:
+        if len(filtered_members) < 2 and not existing_gids:
             continue
 
         target_gid = min(existing_gids) if existing_gids else next_gid
         if not existing_gids:
             next_gid += 1
 
-        for sha in members:
+        for sha in filtered_members:
             if len(sha) == 40:
                 try:
                     b_sha = bytes.fromhex(sha)
@@ -932,11 +942,15 @@ def save_results_to_db(
                 except ValueError:
                     continue
 
+    if filtered_shas_count > 0:
+        print(f"  -> Filtered out {filtered_shas_count:,} SHAs with similarity index < {min_similarity}.")
+
     with conn:
         conn.executemany(
             "INSERT OR REPLACE INTO hashes (hash_value, group_id, detection_type, similarity) VALUES (?, ?, ?, ?)",
             db_records,
         )
+        conn.execute("DELETE FROM hashes WHERE similarity < ?", (min_similarity,))
         if latest_commit and len(latest_commit) == 40:
             conn.execute(
                 "INSERT OR REPLACE INTO state (key, value) VALUES ('last_commit', ?)",
