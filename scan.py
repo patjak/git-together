@@ -25,6 +25,7 @@ CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
 BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
 MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
+MAX_MAINLINE_CYCLE_GAP = 75 * 86400  # Hard 75-day max gap (~1 kernel release cycle)
 TRAILER_LINE_RE = re.compile(
     r"^[A-Za-z0-9-]+:\s+.*$|^[A-Za-z0-9-]+\s+#\d+.*$", re.IGNORECASE
 )
@@ -236,31 +237,27 @@ def process_subject_bucket_chunk(
         n = len(sha_tuples)
         matched_in_bucket = set()
 
-        # 1. Author Date & Clean Body verification
+        # 1. Author Date & Clean Body verification within 75-day window
         for i in range(n):
             sha1, an1, ad1, cd1, cb1 = sha_tuples[i]
             for j in range(i + 1, n):
                 sha2, an2, ad2, cd2, cb2 = sha_tuples[j]
 
-                # Case A: Same Author Date -> Definite Cherry-Pick
+                time_diff = abs(ad1 - ad2) if (ad1 and ad2) else float("inf")
+
+                # Reject any candidate pair beyond 1 kernel version cycle on master branch
+                if time_diff > MAX_MAINLINE_CYCLE_GAP:
+                    continue
+
                 is_author_date_match = ad1 > 0 and ad1 == ad2
-
-                # Case B: Clean Body Match with author/date sanity checks
-                is_clean_body_match = False
-                if cb1 and cb2 and cb1 == cb2:
-                    authors_same = an1.lower() == an2.lower()
-                    time_diff_days = abs(ad1 - ad2) / 86400.0 if (ad1 and ad2) else 0
-
-                    # Reject matching bodies if authors differ AND commits are > 1 year apart
-                    if authors_same or time_diff_days <= 365:
-                        is_clean_body_match = True
+                is_clean_body_match = cb1 and cb2 and cb1 == cb2
 
                 if is_author_date_match or is_clean_body_match:
                     clean_matches.append((sha1, sha2))
                     matched_in_bucket.add(sha1)
                     matched_in_bucket.add(sha2)
 
-        # 2. Fuzzy Body matching for remaining unmatched bucket items
+        # 2. Fuzzy Body matching for remaining unmatched items in 75-day window
         unmatched = [
             t for t in sha_tuples if t[0] not in matched_in_bucket and t[4]
         ]
@@ -271,11 +268,8 @@ def process_subject_bucket_chunk(
                 for j in range(i + 1, len(unmatched)):
                     sha2, an2, ad2, cd2, cb2 = unmatched[j]
 
-                    authors_same = an1.lower() == an2.lower()
-                    time_diff_days = abs(ad1 - ad2) / 86400.0 if (ad1 and ad2) else 0
-
-                    # Require author match OR timestamp proximity (<= 180 days)
-                    if not authors_same and time_diff_days > 180:
+                    time_diff = abs(ad1 - ad2) if (ad1 and ad2) else float("inf")
+                    if time_diff > MAX_MAINLINE_CYCLE_GAP:
                         continue
 
                     len1, len2 = len(cb1), len(cb2)
@@ -283,7 +277,9 @@ def process_subject_bucket_chunk(
                         continue
 
                     sim = compute_similarity(cb1, cb2)
+                    authors_same = an1.lower() == an2.lower()
                     required_sim = 0.85 if authors_same else 0.90
+
                     if sim >= required_sim:
                         fuzzy_matches.append((sha1, sha2, sim))
 
@@ -440,7 +436,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                 sha_to_meta[sha] = (an, ad, cd, cb)
                 dsu.find(sha)
 
-                # Pass 1: Explicit Cherry-Pick Tags
+                # Pass 1: Explicit Cherry-Pick Tags (Bypasses 75-day time limits)
                 match = CHERRY_PICK_RE.search(body)
                 if match:
                     original_sha = match.group(1).lower()
@@ -455,7 +451,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
 
-    # 3. Pass 2 & 3: Subject Bucket evaluation (Author Date, Clean Body & Fuzzy Body)
+    # 3. Pass 2 & 3: Subject Bucket evaluation (75-day window, Author Date, Clean & Fuzzy Body)
     subject_to_shas = defaultdict(list)
     for sha, subj in sha_to_subject.items():
         if subj:
