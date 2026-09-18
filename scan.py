@@ -355,15 +355,16 @@ def process_fallback_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[s
     return results
 
 
-def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
-    repo_path = os.path.abspath(os.path.expanduser(raw_repo_path))
+# -----------------------------------------------------------------------------
+# Modular Pipeline Stage Functions
+# -----------------------------------------------------------------------------
 
+def setup_repository(raw_repo_path: str) -> str:
+    """Validate repository path and structure."""
+    repo_path = os.path.abspath(os.path.expanduser(raw_repo_path))
     if not os.path.exists(repo_path):
         print(f"Error: Repository path '{repo_path}' does not exist.")
         sys.exit(1)
-
-    conn = sqlite3.connect(db_path)
-    init_db(conn)
 
     try:
         run_git(["git", "rev-parse", "--git-dir"], cwd=repo_path)
@@ -371,39 +372,18 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         print(f"Error: Path '{repo_path}' is not a valid Git repository.")
         sys.exit(1)
 
-    last_commit = get_last_processed_commit(conn, repo_path)
-    if last_commit:
-        rev_spec = f"{last_commit}..HEAD"
-        print(f"Resuming scan from last commit checkpoint: {last_commit[:10]}...")
-    else:
-        rev_spec = "HEAD"
-        print("Starting full scan from beginning of repository...")
+    return repo_path
 
-    print(f"Fetching commit list for range ({rev_spec})...")
-    new_commits = get_commit_list(repo_path, rev_spec)
-    total_new_commits = len(new_commits)
-    new_commits_set = set(new_commits)
 
-    if total_new_commits == 0:
-        print("No new commits to process.")
-        conn.close()
-        return
-
-    print(
-        f"Found {total_new_commits:,} new commits. Using {num_workers} CPU cores for processing."
-    )
-    if HAS_RAPIDFUZZ:
-        print("Using rapidfuzz (C++ engine) for high-performance fuzzy body matching.")
-    else:
-        print("Using difflib fallback for fuzzy body matching.")
-
-    dsu = DisjointSet()
+def load_existing_db_state(
+    conn: sqlite3.Connection, dsu: DisjointSet
+) -> Tuple[dict, defaultdict, defaultdict]:
+    """Load existing mapping state and build initial DisjointSet groups."""
     existing_sha_to_gid = {}
     gid_to_shas = defaultdict(list)
     sha_detection = defaultdict(set)
     sha_similarity = defaultdict(float)
 
-    # 1. Load existing database state
     print("Loading existing database state into memory...")
     cur = conn.cursor()
     cur.execute("SELECT hex(hash_value), group_id, detection_type, similarity FROM hashes")
@@ -425,10 +405,19 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         for other_sha in shas[1:]:
             dsu.union(first_sha, other_sha)
 
-    existing_db_shas = list(existing_sha_to_gid.keys())
-    shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
+    return existing_sha_to_gid, sha_detection, sha_similarity
 
-    # 2. Fast Metadata Pass (Author, Dates, Subject, Full Body, Cleaned Body)
+
+def run_metadata_pass(
+    repo_path: str,
+    shas_to_scan: List[str],
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    sha_similarity: defaultdict,
+    num_workers: int,
+) -> Tuple[dict, dict, int]:
+    """Extract metadata for SHAs and identify explicit cherry-pick tag relationships."""
     print(f"Fetching metadata for {len(shas_to_scan):,} commits...")
     chunks = [
         (repo_path, shas_to_scan[i : i + CHUNK_SIZE])
@@ -436,8 +425,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     ]
 
     sha_to_subject = {}
-    sha_to_meta = {}  # sha -> (author_name, author_date, committer_date, cleaned_body)
-    latest_commit = new_commits[-1] if new_commits else None
+    sha_to_meta = {}
     tag_match_count = 0
 
     with multiprocessing.Pool(processes=num_workers) as pool:
@@ -447,7 +435,6 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                 sha_to_meta[sha] = (an, ad, cd, cb)
                 dsu.find(sha)
 
-                # Pass 1: Explicit Cherry-Pick Tags (Bypasses 75-day time limits)
                 match = CHERRY_PICK_RE.search(body)
                 if match:
                     original_sha = match.group(1).lower()
@@ -461,8 +448,19 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                         sha_similarity[original_sha] = max(sha_similarity[original_sha], 1.0)
 
     print(f"  -> Detected {tag_match_count:,} new commits via explicit 'cherry picked from' tags.")
+    return sha_to_subject, sha_to_meta, tag_match_count
 
-    # 3. Pass 2 & 3: Subject Bucket evaluation (75-day window, Author Date, Clean & Fuzzy Body)
+
+def run_subject_bucket_pass(
+    sha_to_subject: dict,
+    sha_to_meta: dict,
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    sha_similarity: defaultdict,
+    num_workers: int,
+) -> Tuple[dict, dict]:
+    """Group commits by subject and match via timestamps, clean bodies, and fuzzy matching."""
     subject_to_shas = defaultdict(list)
     for sha, subj in sha_to_subject.items():
         if subj:
@@ -479,12 +477,11 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     ]
     candidate_buckets.sort(key=len, reverse=True)
 
-    author_date_group_count = 0
-    author_date_commit_count = 0
-    clean_body_group_count = 0
-    clean_body_commit_count = 0
-    fuzzy_body_group_count = 0
-    fuzzy_body_commit_count = 0
+    stats = {
+        "ad_groups": 0, "ad_commits": 0,
+        "clean_groups": 0, "clean_commits": 0,
+        "fuzzy_groups": 0, "fuzzy_commits": 0,
+    }
 
     if candidate_buckets:
         print(
@@ -512,11 +509,11 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                     sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
-                        author_date_group_count += 1
+                        stats["ad_groups"] += 1
                         if sha1 in new_commits_set:
-                            author_date_commit_count += 1
+                            stats["ad_commits"] += 1
                         if sha2 in new_commits_set:
-                            author_date_commit_count += 1
+                            stats["ad_commits"] += 1
 
                 for sha1, sha2 in clean_matches:
                     dsu.union(sha1, sha2)
@@ -526,11 +523,11 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                     sha_similarity[sha2] = max(sha_similarity[sha2], 1.0)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
-                        clean_body_group_count += 1
+                        stats["clean_groups"] += 1
                         if sha1 in new_commits_set:
-                            clean_body_commit_count += 1
+                            stats["clean_commits"] += 1
                         if sha2 in new_commits_set:
-                            clean_body_commit_count += 1
+                            stats["clean_commits"] += 1
 
                 for sha1, sha2, sim in fuzzy_matches:
                     dsu.union(sha1, sha2)
@@ -540,11 +537,11 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                     sha_similarity[sha2] = max(sha_similarity[sha2], sim)
 
                     if sha1 in new_commits_set or sha2 in new_commits_set:
-                        fuzzy_body_group_count += 1
+                        stats["fuzzy_groups"] += 1
                         if sha1 in new_commits_set:
-                            fuzzy_body_commit_count += 1
+                            stats["fuzzy_commits"] += 1
                         if sha2 in new_commits_set:
-                            fuzzy_body_commit_count += 1
+                            stats["fuzzy_commits"] += 1
 
                 pct = min((processed_buckets / total_buckets) * 100, 100.0)
                 sys.stdout.write(
@@ -552,12 +549,26 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                 )
                 sys.stdout.flush()
 
+        pct = min((processed_buckets / total_buckets) * 100, 100.0) if total_buckets else 100.0
         sys.stdout.write(
             f"\r\033[K  Subject Bucket Scan: {processed_buckets:,}/{total_buckets:,} buckets evaluated ({pct:.1f}%)\n"
         )
         sys.stdout.flush()
 
-    # 4. Pass 4: Targeted Patch-ID Fallback for remaining unmatched commits in candidate buckets
+    return subject_to_shas, stats
+
+
+def run_patch_id_fallback_pass(
+    repo_path: str,
+    subject_to_shas: dict,
+    sha_to_subject: dict,
+    new_commits_set: Set[str],
+    dsu: DisjointSet,
+    sha_detection: defaultdict,
+    sha_similarity: defaultdict,
+    num_workers: int,
+) -> Tuple[int, int]:
+    """Run patch-ID fallback on candidates that were not matched by earlier passes."""
     fallback_shas = set()
     for subj, shas in subject_to_shas.items():
         if len(shas) >= 2:
@@ -602,15 +613,34 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
         print(f"  -> Detected {patch_commit_count:,} new commits via patch-ID fallback.")
 
+    return patch_group_count, patch_commit_count
+
+
+def print_detection_summary(
+    tag_match_count: int,
+    bucket_stats: dict,
+    patch_group_count: int,
+    patch_commit_count: int,
+):
+    """Print the final run summary metrics."""
     print("\n--- Detection Summary (Current Run Only) ---")
     print(f"  Explicit Tags Found     : {tag_match_count:,} commits")
-    print(f"  Subject+Author Date Match: {author_date_commit_count:,} commits ({author_date_group_count:,} groups)")
-    print(f"  Subject+Clean Body Match: {clean_body_commit_count:,} commits ({clean_body_group_count:,} groups)")
-    print(f"  Subject+Fuzzy Body Match: {fuzzy_body_commit_count:,} commits ({fuzzy_body_group_count:,} groups)")
+    print(f"  Subject+Author Date Match: {bucket_stats['ad_commits']:,} commits ({bucket_stats['ad_groups']:,} groups)")
+    print(f"  Subject+Clean Body Match: {bucket_stats['clean_commits']:,} commits ({bucket_stats['clean_groups']:,} groups)")
+    print(f"  Subject+Fuzzy Body Match: {bucket_stats['fuzzy_commits']:,} commits ({bucket_stats['fuzzy_groups']:,} groups)")
     print(f"  Patch-ID Fallback Match : {patch_commit_count:,} commits ({patch_group_count:,} groups)")
     print("--------------------------------------------\n")
 
-    # 5. Write results to SQLite
+
+def save_results_to_db(
+    conn: sqlite3.Connection,
+    dsu: DisjointSet,
+    existing_sha_to_gid: dict,
+    sha_detection: defaultdict,
+    sha_similarity: defaultdict,
+    latest_commit: Optional[str],
+):
+    """Persist final group assignments and commit checkpoints to SQLite."""
     print("Writing groups to SQLite...")
     root_to_members = defaultdict(list)
     for sha in dsu.parent:
@@ -670,6 +700,69 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     conn.close()
     print(f"Done! Saved {len(db_records):,} linked commit hashes to DB.")
+
+
+def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
+    """Main pipeline driver orchestrating repo processing."""
+    repo_path = setup_repository(raw_repo_path)
+
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+
+    last_commit = get_last_processed_commit(conn, repo_path)
+    if last_commit:
+        rev_spec = f"{last_commit}..HEAD"
+        print(f"Resuming scan from last commit checkpoint: {last_commit[:10]}...")
+    else:
+        rev_spec = "HEAD"
+        print("Starting full scan from beginning of repository...")
+
+    print(f"Fetching commit list for range ({rev_spec})...")
+    new_commits = get_commit_list(repo_path, rev_spec)
+    total_new_commits = len(new_commits)
+    new_commits_set = set(new_commits)
+
+    if total_new_commits == 0:
+        print("No new commits to process.")
+        conn.close()
+        return
+
+    print(
+        f"Found {total_new_commits:,} new commits. Using {num_workers} CPU cores for processing."
+    )
+    if HAS_RAPIDFUZZ:
+        print("Using rapidfuzz (C++ engine) for high-performance fuzzy body matching.")
+    else:
+        print("Using difflib fallback for fuzzy body matching.")
+
+    dsu = DisjointSet()
+    existing_sha_to_gid, sha_detection, sha_similarity = load_existing_db_state(conn, dsu)
+
+    existing_db_shas = list(existing_sha_to_gid.keys())
+    shas_to_scan = list(dict.fromkeys(new_commits + existing_db_shas))
+
+    # 1. Metadata and Explicit Cherry-Pick Tags Pass
+    sha_to_subject, sha_to_meta, tag_match_count = run_metadata_pass(
+        repo_path, shas_to_scan, new_commits_set, dsu, sha_detection, sha_similarity, num_workers
+    )
+
+    # 2. Subject Bucket Matching Pass
+    subject_to_shas, bucket_stats = run_subject_bucket_pass(
+        sha_to_subject, sha_to_meta, new_commits_set, dsu, sha_detection, sha_similarity, num_workers
+    )
+
+    # 3. Targeted Patch-ID Fallback Pass
+    patch_group_count, patch_commit_count = run_patch_id_fallback_pass(
+        repo_path, subject_to_shas, sha_to_subject, new_commits_set, dsu, sha_detection, sha_similarity, num_workers
+    )
+
+    # 4. Summary & DB Persistence
+    print_detection_summary(tag_match_count, bucket_stats, patch_group_count, patch_commit_count)
+
+    latest_commit = new_commits[-1] if new_commits else None
+    save_results_to_db(
+        conn, dsu, existing_sha_to_gid, sha_detection, sha_similarity, latest_commit
+    )
 
 
 if __name__ == "__main__":
