@@ -12,6 +12,7 @@ DETECTION_LABELS = {
     2: "Subject + Clean Body Match",
     3: "Subject + Fuzzy Body Match",
     4: "Patch-ID + Subject Fallback",
+    5: "Subject + Author Date Match",
 }
 
 EXAMPLES_TEXT = """examples:
