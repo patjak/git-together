@@ -192,10 +192,11 @@ class CommitBrowserApp(App):
         ("shift+tab", "focus_previous", "Focus Prev Pane"),
     ]
 
-    def __init__(self, repo_path: str, db_path: str):
+    def __init__(self, repo_path: str, db_path: str, blacklist_path: str = "blacklisted_shas.txt"):
         super().__init__()
         self.repo_path = os.path.abspath(os.path.expanduser(repo_path))
         self.db_path = db_path
+        self.blacklist_path = os.path.abspath(os.path.expanduser(blacklist_path))
         self.conn = None
         self.group_ids = []
         self.current_shas = []
@@ -221,9 +222,9 @@ class CommitBrowserApp(App):
 
     def load_blacklist(self) -> None:
         self.blacklisted_shas = set()
-        if os.path.exists("blacklisted_shas.txt"):
+        if os.path.exists(self.blacklist_path):
             try:
-                with open("blacklisted_shas.txt", "r") as f:
+                with open(self.blacklist_path, "r") as f:
                     for line in f:
                         sha = line.strip().lower()
                         if sha:
@@ -233,7 +234,7 @@ class CommitBrowserApp(App):
 
     def save_blacklist(self) -> None:
         try:
-            with open("blacklisted_shas.txt", "w") as f:
+            with open(self.blacklist_path, "w") as f:
                 for sha in sorted(self.blacklisted_shas):
                     f.write(f"{sha}\n")
         except Exception as e:
@@ -570,7 +571,12 @@ if __name__ == "__main__":
         default="git-together.db",
         help="Path to the SQLite database file.",
     )
+    parser.add_argument(
+        "--blacklist",
+        default="blacklisted_shas.txt",
+        help="Path to the blacklisted SHAs text file.",
+    )
 
     args = parser.parse_args()
-    app = CommitBrowserApp(args.repo_path, args.db)
+    app = CommitBrowserApp(args.repo_path, args.db, args.blacklist)
     app.run()
