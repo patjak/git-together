@@ -147,7 +147,7 @@ def get_last_processed_commit(conn: sqlite3.Connection, repo_path: str) -> Optio
 def get_commit_list(repo_path: str, rev_spec: str) -> List[str]:
     try:
         out = run_git(
-            ["git", "rev-list", "--reverse", "--no-abbrev-commit", rev_spec],
+            ["git", "rev-list", "--no-merges", "--reverse", "--no-abbrev-commit", rev_spec],
             cwd=repo_path,
         )
         return [c for c in out.splitlines() if len(c) == 40] if out else []
@@ -168,6 +168,7 @@ def fetch_commit_metadata_chunk(args: Tuple[str, List[str]]) -> dict:
         "-z",
         "--ignore-missing",
         "--no-walk",
+        "--no-merges",
         "--stdin",
         "--format=%H%n%s%n%b",
     ]
@@ -255,6 +256,7 @@ def process_fallback_patch_id_chunk(args: Tuple[str, List[str]]) -> List[Tuple[s
         "log",
         "--ignore-missing",
         "--no-walk",
+        "--no-merges",
         "--stdin",
         "-p",
         "--no-renames",
