@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 
 import argparse
-import difflib
 import multiprocessing
 import os
 import re
@@ -12,10 +11,20 @@ from collections import defaultdict
 from enum import IntEnum
 from typing import List, Optional, Set, Tuple
 
+try:
+    from rapidfuzz import fuzz
+
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    import difflib
+
+    HAS_RAPIDFUZZ = False
+
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
-BUCKET_CHUNK_SIZE = 500  # Number of subject buckets per worker task
+BUCKET_CHUNK_SIZE = 20  # Reduced chunk size for granular worker load-balancing
+MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
 TRAILER_LINE_RE = re.compile(
     r"^[A-Za-z0-9-]+:\s+.*$|^[A-Za-z0-9-]+\s+#\d+.*$", re.IGNORECASE
 )
@@ -45,6 +54,13 @@ def strip_trailers_and_normalize(body: str) -> str:
 
     cleaned_lines = lines[: idx + 1]
     return " ".join(" ".join(cleaned_lines).lower().split())
+
+
+def compute_similarity(s1: str, s2: str) -> float:
+    """Calculates string similarity using rapidfuzz (if available) or difflib fallback."""
+    if HAS_RAPIDFUZZ:
+        return fuzz.ratio(s1, s2) / 100.0
+    return difflib.SequenceMatcher(None, s1, s2).ratio()
 
 
 class DisjointSet:
@@ -269,7 +285,9 @@ def process_subject_bucket_chunk(
         unmatched = [
             (sha, cb) for sha, cb in sha_tuples if sha not in matched_in_subject and cb
         ]
-        if len(unmatched) > 1:
+
+        # Cap O(N^2) fuzzy matching pass on generic subjects with large numbers of distinct bodies
+        if 1 < len(unmatched) <= MAX_FUZZY_BUCKET_SIZE:
             for i in range(len(unmatched)):
                 sha1, cb1 = unmatched[i]
                 for j in range(i + 1, len(unmatched)):
@@ -277,7 +295,7 @@ def process_subject_bucket_chunk(
                     len1, len2 = len(cb1), len(cb2)
                     if min(len1, len2) / max(len1, len2) < 0.70:
                         continue
-                    if difflib.SequenceMatcher(None, cb1, cb2).ratio() >= 0.85:
+                    if compute_similarity(cb1, cb2) >= 0.85:
                         fuzzy_matches.append((sha1, sha2))
 
     return len(chunk_buckets), clean_matches, fuzzy_matches
@@ -366,6 +384,10 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     print(
         f"Found {total_new_commits:,} new commits. Using {num_workers} CPU cores for processing."
     )
+    if HAS_RAPIDFUZZ:
+        print("Using rapidfuzz (C++ engine) for high-performance fuzzy body matching.")
+    else:
+        print("Using difflib fallback for fuzzy body matching (install 'rapidfuzz' for faster scans).")
 
     dsu = DisjointSet()
     existing_sha_to_gid = {}
@@ -500,6 +522,9 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
         if len(shas) >= 2
     ]
 
+    # Sort candidate buckets by size descending (Longest Processing Time First)
+    candidate_buckets.sort(key=len, reverse=True)
+
     clean_body_group_count = 0
     clean_body_commit_count = 0
     fuzzy_body_group_count = 0
@@ -507,7 +532,7 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
 
     if candidate_buckets:
         print(
-            f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers..."
+            f"Evaluating {len(candidate_buckets):,} subject buckets across {num_workers} workers (sorted heaviest first)..."
         )
         bucket_chunks = [
             candidate_buckets[i : i + BUCKET_CHUNK_SIZE]
