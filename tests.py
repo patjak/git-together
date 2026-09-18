@@ -10,11 +10,11 @@ import unittest
 from scan import (
     CHERRY_PICK_RE,
     DisjointSet,
+    Workers,
     get_commit_list,
     init_db,
-    process_patch_id_chunk,
     process_repository,
-    stream_commit_messages,
+    strip_trailers_and_normalize,
 )
 
 
@@ -36,8 +36,8 @@ class TestDisjointSet(unittest.TestCase):
         self.assertEqual(dsu.find("a"), dsu.find("c"))
 
 
-class TestRegex(unittest.TestCase):
-    """Unit tests for cherry-pick tag regex parsing."""
+class TestRegexAndNormalization(unittest.TestCase):
+    """Unit tests for regex parsing and commit body normalization."""
 
     def test_cherry_pick_regex(self):
         sha = "a" * 40
@@ -52,6 +52,19 @@ class TestRegex(unittest.TestCase):
 
         short_sha = "(cherry picked from commit abc1234)"
         self.assertIsNone(CHERRY_PICK_RE.search(short_sha))
+
+    def test_strip_trailers_and_normalize(self):
+        body = (
+            "Fix edge case in parser\n\n"
+            "This fixes an unhandled null dereference.\n\n"
+            "Signed-off-by: Test User <test@example.com>\n"
+            "(cherry picked from commit " + "a" * 40 + ")\n"
+        )
+        cleaned = strip_trailers_and_normalize(body)
+        self.assertEqual(
+            cleaned,
+            "fix edge case in parser this fixes an unhandled null dereference.",
+        )
 
 
 class TestDatabaseInit(unittest.TestCase):
@@ -99,26 +112,25 @@ class TestGitIntegration(unittest.TestCase):
         self._run_git(["git", "commit", "-m", msg])
         return self._run_git(["git", "rev-parse", "HEAD"])
 
-    def test_commit_streaming_and_list(self):
+    def test_fetch_commit_metadata_and_list(self):
         sha1 = self._make_commit("file.txt", "line 1\n", "Initial commit")
         sha2 = self._make_commit("file.txt", "line 2\n", "Second commit")
 
         commit_list = get_commit_list(self.repo_path, "HEAD")
         self.assertEqual(commit_list, [sha1, sha2])
 
-        messages = list(stream_commit_messages(self.repo_path, "HEAD"))
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0][0], sha1)
-        self.assertIn("Initial commit", messages[0][1])
+        metadata_dict = Workers.fetch_commit_metadata((self.repo_path, [sha1, sha2]))
+        self.assertEqual(len(metadata_dict), 2)
+        self.assertIn(sha1, metadata_dict)
+        self.assertEqual(metadata_dict[sha1].subject, "Initial commit")
 
-    def test_process_patch_id_chunk(self):
+    def test_process_fallback_patch_id(self):
         sha1 = self._make_commit("file.txt", "line 1\n", "Feature patch")
-        results = process_patch_id_chunk((self.repo_path, [sha1]))
+        results = Workers.process_fallback_patch_id((self.repo_path, [sha1]))
 
         self.assertEqual(len(results), 1)
-        patch_id, subject, returned_sha = results[0]
+        patch_id, returned_sha = results[0]
         self.assertEqual(returned_sha, sha1)
-        self.assertEqual(subject, "Feature patch")
         self.assertTrue(len(patch_id) > 0)
 
     def test_revert_of_revert_not_grouped(self):
@@ -179,4 +191,3 @@ class TestGitIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
