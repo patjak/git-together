@@ -26,8 +26,13 @@ CHUNK_SIZE = 2000  # Number of commits per worker task
 BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
 MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
 MAX_MAINLINE_CYCLE_GAP = 75 * 86400  # Hard 75-day max gap (~1 kernel release cycle)
+
 TRAILER_LINE_RE = re.compile(
-    r"^[A-Za-z0-9-]+:\s+.*$|^[A-Za-z0-9-]+\s+#\d+.*$", re.IGNORECASE
+    r"^[A-Za-z0-9-]+:\s+.*$"                             # Key: Value (Signed-off-by, Cc, Fixes, Link, etc.)
+    r"|^[A-Za-z0-9-]+\s+#\d+.*$"                         # Issue/PR references
+    r"|^\(cherry picked from commit [a-fA-F0-9]{40}\)$"  # Cherry-pick line
+    r"|^\[.*\]$",                                        # Maintainer notes e.g. [ rjw: commit msg tweak ]
+    re.IGNORECASE
 )
 
 
