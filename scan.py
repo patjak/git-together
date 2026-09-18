@@ -66,6 +66,7 @@ class CommitInfo:
     subject: str
     body: str
     cleaned_body: str
+    files: Set[str]
 
 
 def strip_trailers_and_normalize(body: str) -> str:
@@ -196,7 +197,7 @@ class Workers:
 
     @staticmethod
     def fetch_commit_metadata(args: Tuple[str, List[str]]) -> Dict[str, CommitInfo]:
-        """Worker function: Stream author, dates, subject and body metadata for a chunk of SHAs."""
+        """Worker function: Stream author, dates, subject, body, and modified files for a chunk of SHAs."""
         repo_path, shas = args
         input_shas = "\n".join(shas) + "\n"
 
@@ -210,7 +211,8 @@ class Workers:
             "--no-walk",
             "--no-merges",
             "--stdin",
-            "--format=%H%n%an%n%at%n%ct%n%s%n%b",
+            "--name-only",
+            "--format=%H%n%an%n%at%n%ct%n%s%n%b%x01",
         ]
         proc = subprocess.Popen(
             cmd,
@@ -226,6 +228,8 @@ class Workers:
             pass
 
         buffer = bytearray()
+        curr_info: Optional[CommitInfo] = None
+
         while True:
             chunk = proc.stdout.read(65536)
             if not chunk:
@@ -235,8 +239,14 @@ class Workers:
                 pos = buffer.index(b"\x00")
                 record = buffer[:pos].decode("utf-8", errors="replace")
                 del buffer[: pos + 1]
-                if record:
-                    parts = record.split("\n", 5)
+
+                if "\x01" in record:
+                    if curr_info:
+                        sha_to_info[curr_info.sha] = curr_info
+                        curr_info = None
+
+                    meta_part, first_file = record.split("\x01", 1)
+                    parts = meta_part.split("\n", 5)
                     if len(parts) >= 5 and len(parts[0].strip()) == 40:
                         sha = parts[0].strip().lower()
                         author_name = parts[1].strip()
@@ -252,7 +262,11 @@ class Workers:
                         body = parts[5] if len(parts) > 5 else ""
                         cleaned_body = strip_trailers_and_normalize(body)
 
-                        sha_to_info[sha] = CommitInfo(
+                        files = set()
+                        if first_file.strip():
+                            files.add(first_file.strip())
+
+                        curr_info = CommitInfo(
                             sha=sha,
                             author_name=author_name,
                             author_date=author_date,
@@ -260,7 +274,15 @@ class Workers:
                             subject=subject,
                             body=body,
                             cleaned_body=cleaned_body,
+                            files=files,
                         )
+                elif curr_info:
+                    f = record.strip()
+                    if f:
+                        curr_info.files.add(f)
+
+        if curr_info:
+            sha_to_info[curr_info.sha] = curr_info
 
         proc.stdout.close()
         proc.wait()
@@ -285,6 +307,10 @@ class Workers:
                 for j in range(i + 1, n):
                     c2 = commits[j]
 
+                    # Enforce file overlap check to eliminate false positives on identical subjects across different files
+                    if c1.files and c2.files and not (c1.files & c2.files):
+                        continue
+
                     time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
 
                     # Reject any candidate pair beyond 1 kernel version cycle on master branch
@@ -293,12 +319,13 @@ class Workers:
 
                     is_author_date_match = c1.author_date > 0 and c1.author_date == c2.author_date
                     is_clean_body_match = bool(c1.cleaned_body and c2.cleaned_body and c1.cleaned_body == c2.cleaned_body)
+                    is_meaningful_body = len(c1.cleaned_body) > 30 and len(c2.cleaned_body) > 30
 
                     if is_author_date_match:
                         author_date_matches.append((c1.sha, c2.sha))
                         matched_in_bucket.add(c1.sha)
                         matched_in_bucket.add(c2.sha)
-                    elif is_clean_body_match:
+                    elif is_clean_body_match and is_meaningful_body:
                         clean_matches.append((c1.sha, c2.sha))
                         matched_in_bucket.add(c1.sha)
                         matched_in_bucket.add(c2.sha)
@@ -313,6 +340,10 @@ class Workers:
                     c1 = unmatched[i]
                     for j in range(i + 1, len(unmatched)):
                         c2 = unmatched[j]
+
+                        # Enforce file overlap check for fuzzy matches
+                        if c1.files and c2.files and not (c1.files & c2.files):
+                            continue
 
                         time_diff = abs(c1.author_date - c2.author_date) if (c1.author_date and c2.author_date) else float("inf")
                         if time_diff > MAX_MAINLINE_CYCLE_GAP:
