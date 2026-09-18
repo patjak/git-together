@@ -45,6 +45,16 @@ class DetectionType(IntEnum):
     SUBJECT_AUTHOR_DATE = 5  # High-confidence subject + author timestamp match
 
 
+# Explicit detection priority order for DB persistence selection
+DETECTION_PRIORITY = (
+    DetectionType.CHERRY_PICK,
+    DetectionType.SUBJECT_AUTHOR_DATE,
+    DetectionType.SUBJECT_CLEAN_BODY,
+    DetectionType.SUBJECT_FUZZY_BODY,
+    DetectionType.PATCH_ID_SUBJECT,
+)
+
+
 @dataclass(slots=True)
 class CommitInfo:
     """Strongly-typed metadata container for commit comparisons."""
@@ -681,19 +691,10 @@ def save_results_to_db(
                     b_sha = bytes.fromhex(sha)
                     if len(b_sha) == 20:
                         types = sha_detection.get(sha, set())
-                        if DetectionType.CHERRY_PICK in types:
-                            dt_val = DetectionType.CHERRY_PICK
-                        elif DetectionType.SUBJECT_AUTHOR_DATE in types:
-                            dt_val = DetectionType.SUBJECT_AUTHOR_DATE
-                        elif DetectionType.SUBJECT_CLEAN_BODY in types:
-                            dt_val = DetectionType.SUBJECT_CLEAN_BODY
-                        elif DetectionType.SUBJECT_FUZZY_BODY in types:
-                            dt_val = DetectionType.SUBJECT_FUZZY_BODY
-                        elif DetectionType.PATCH_ID_SUBJECT in types:
-                            dt_val = DetectionType.PATCH_ID_SUBJECT
-                        else:
-                            dt_val = DetectionType.CHERRY_PICK
-
+                        dt_val = next(
+                            (t for t in DETECTION_PRIORITY if t in types),
+                            DetectionType.CHERRY_PICK,
+                        )
                         sim_val = sha_similarity.get(sha, 1.0)
                         db_records.append((b_sha, target_gid, dt_val.value, sim_val))
                 except ValueError:
