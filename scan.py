@@ -8,11 +8,17 @@ import sqlite3
 import subprocess
 import sys
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from enum import IntEnum
+from typing import List, Optional, Tuple, Set
 
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
 CHUNK_SIZE = 2000  # Number of commits per worker task
+
+
+class DetectionType(IntEnum):
+    CHERRY_PICK = 1
+    PATCH_ID_SUBJECT = 2
 
 
 class DisjointSet:
@@ -63,7 +69,8 @@ def init_db(conn: sqlite3.Connection):
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS hashes (
                 hash_value BLOB NOT NULL PRIMARY KEY CHECK(length(hash_value) = 20),
-                group_id INTEGER NOT NULL
+                group_id INTEGER NOT NULL,
+                detection_type INTEGER NOT NULL
             ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS idx_hashes_group ON hashes(group_id);
@@ -295,16 +302,22 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
     dsu = DisjointSet()
     existing_sha_to_gid = {}
     gid_to_shas = defaultdict(list)
+    sha_detection = defaultdict(set)
 
     # 1. Load and reconstruct existing database groups in DSU
     print("Loading existing database state into memory...")
     cur = conn.cursor()
-    cur.execute("SELECT hex(hash_value), group_id FROM hashes")
-    for sha_hex, gid in cur.fetchall():
+    cur.execute("SELECT hex(hash_value), group_id, detection_type FROM hashes")
+    for sha_hex, gid, dt_int in cur.fetchall():
         sha_lower = sha_hex.lower()
         if len(sha_lower) == 40:
             existing_sha_to_gid[sha_lower] = gid
             gid_to_shas[gid].append(sha_lower)
+            if dt_int is not None:
+                try:
+                    sha_detection[sha_lower].add(DetectionType(dt_int))
+                except ValueError:
+                    pass
 
     for gid, shas in gid_to_shas.items():
         first_sha = shas[0]
@@ -328,6 +341,8 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
             if len(original_sha) == 40:
                 dsu.union(sha, original_sha)
                 tag_match_count += 1
+                sha_detection[sha].add(DetectionType.CHERRY_PICK)
+                sha_detection[original_sha].add(DetectionType.CHERRY_PICK)
 
         if msg_count % 1000 == 0:
             pct = min((msg_count / total_new_commits) * 100, 100.0)
@@ -387,6 +402,9 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
             for other_sha in shas[1:]:
                 dsu.union(first_sha, other_sha)
 
+            for s in shas:
+                sha_detection[s].add(DetectionType.PATCH_ID_SUBJECT)
+
             # Count ONLY matches involving new commits scanned in the current run
             new_in_group = [s for s in shas if s in new_commits_set]
             if new_in_group:
@@ -430,13 +448,21 @@ def process_repository(raw_repo_path: str, db_path: str, num_workers: int):
                 try:
                     b_sha = bytes.fromhex(sha)
                     if len(b_sha) == 20:
-                        db_records.append((b_sha, target_gid))
+                        types = sha_detection.get(sha, set())
+                        if DetectionType.CHERRY_PICK in types:
+                            dt_val = DetectionType.CHERRY_PICK
+                        elif DetectionType.PATCH_ID_SUBJECT in types:
+                            dt_val = DetectionType.PATCH_ID_SUBJECT
+                        else:
+                            dt_val = DetectionType.CHERRY_PICK
+
+                        db_records.append((b_sha, target_gid, dt_val.value))
                 except ValueError:
                     continue
 
     with conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO hashes (hash_value, group_id) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO hashes (hash_value, group_id, detection_type) VALUES (?, ?, ?)",
             db_records,
         )
         if latest_commit and len(latest_commit) == 40:
