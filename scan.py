@@ -23,7 +23,7 @@ except ImportError:
 
 DB_NAME = "git-together.db"
 CHERRY_PICK_RE = re.compile(r"\(cherry picked from commit ([a-fA-F0-9]{40})\)")
-CHUNK_SIZE = 2000  # Number of commits per worker task
+CHUNK_SIZE = 2000  # Default commit chunk size
 BUCKET_CHUNK_SIZE = 20  # Granular worker load-balancing
 MAX_FUZZY_BUCKET_SIZE = 50  # Cap O(N^2) fuzzy matching on generic subject buckets
 MAX_MAINLINE_CYCLE_GAP = 75 * 86400  # Hard 75-day max gap (~1 kernel release cycle)
@@ -35,6 +35,15 @@ TRAILER_LINE_RE = re.compile(
     r"|^\[.*\]$",                                        # Maintainer notes e.g. [ rjw: commit msg tweak ]
     re.IGNORECASE
 )
+
+# Global container inside worker process space to prevent IPC payload bloat
+_WORKER_SHA_TO_DIFF: Dict[str, str] = {}
+
+
+def _init_similarity_worker(sha_to_diff: Dict[str, str]):
+    """Initialize similarity worker by storing sha_to_diff once per process."""
+    global _WORKER_SHA_TO_DIFF
+    _WORKER_SHA_TO_DIFF = sha_to_diff
 
 
 class DetectionType(IntEnum):
@@ -351,10 +360,11 @@ class Workers:
 
     @staticmethod
     def compute_group_similarities(
-        args: Tuple[List[List[str]], Dict[str, str]]
+        groups: List[List[str]]
     ) -> Tuple[int, List[Tuple[str, float]]]:
-        """Worker function: Compute symmetric peer similarity scores for groups of commits."""
-        groups, sha_to_diff = args
+        """Worker function: Compute symmetric peer similarity scores using pre-initialized worker diff state."""
+        global _WORKER_SHA_TO_DIFF
+        sha_to_diff = _WORKER_SHA_TO_DIFF
         results = []
 
         for group in groups:
@@ -364,11 +374,9 @@ class Workers:
                     results.append((sha, 1.0))
                 continue
 
-            # Compute unique pairwise similarities once (Symmetric Cache)
             pair_sims = {}
             for i in range(n):
                 s1 = group[i]
-                # Cap diff length at 10k chars for fast similarity evaluation
                 d1 = sha_to_diff.get(s1, "")[:10000]
                 for j in range(i + 1, n):
                     s2 = group[j]
@@ -780,7 +788,7 @@ def run_file_change_similarity_pass(
     sha_similarity: defaultdict,
     num_workers: int,
 ):
-    """Compute file change similarity index in parallel with optimized LPT scheduling."""
+    """Compute file change similarity index using single-transfer worker state initialization."""
     root_to_members = defaultdict(list)
     for sha in list(dsu.parent.keys()):
         root = dsu.find(sha)
@@ -822,19 +830,26 @@ def run_file_change_similarity_pass(
         )
         sys.stdout.flush()
 
-        # 2. Sort groups by estimated workload (N^2) descending (LPT Scheduling)
-        group_members_list.sort(key=lambda g: len(g), reverse=True)
+    # 2. Sort groups by size descending (LPT)
+    group_members_list.sort(key=lambda g: len(g), reverse=True)
 
-        # Use finer chunk size to prevent stragglers
-        group_chunk_size = max(1, len(group_members_list) // (num_workers * 16))
-        group_chunks = [
-            (group_members_list[i : i + group_chunk_size], sha_to_diff)
-            for i in range(0, len(group_members_list), group_chunk_size)
-        ]
+    # 3. Target ~4 chunks per CPU worker (~128 chunks on 32 cores)
+    target_chunks = num_workers * 4
+    group_chunk_size = max(1, len(group_members_list) // target_chunks)
+    group_chunks = [
+        group_members_list[i : i + group_chunk_size]
+        for i in range(0, len(group_members_list), group_chunk_size)
+    ]
 
-        processed_groups = 0
-        total_groups = len(group_members_list)
+    processed_groups = 0
+    total_groups = len(group_members_list)
 
+    # Pass sha_to_diff ONCE per worker using initializer
+    with multiprocessing.Pool(
+        processes=num_workers,
+        initializer=_init_similarity_worker,
+        initargs=(sha_to_diff,),
+    ) as pool:
         for count, chunk_results in pool.imap_unordered(
             Workers.compute_group_similarities, group_chunks
         ):
@@ -848,11 +863,11 @@ def run_file_change_similarity_pass(
             )
             sys.stdout.flush()
 
-        pct = min((processed_groups / total_groups) * 100, 100.0) if total_groups else 100.0
-        sys.stdout.write(
-            f"\r\033[K  Group Similarity Calculation: {processed_groups:,}/{total_groups:,} groups evaluated ({pct:.1f}%)\n"
-        )
-        sys.stdout.flush()
+    pct = min((processed_groups / total_groups) * 100, 100.0) if total_groups else 100.0
+    sys.stdout.write(
+        f"\r\033[K  Group Similarity Calculation: {processed_groups:,}/{total_groups:,} groups evaluated ({pct:.1f}%)\n"
+    )
+    sys.stdout.flush()
 
 
 def print_detection_summary(
