@@ -130,7 +130,7 @@ class CommitBrowserApp(App):
     def load_shas_for_group(self, group_id: int) -> None:
         cur = self.conn.cursor()
         cur.execute("""
-            SELECT lower(hex(hash_value)), detection_type 
+            SELECT lower(hex(hash_value)), detection_type, similarity 
             FROM hashes 
             WHERE group_id = ?
         """, (group_id,))
@@ -140,10 +140,11 @@ class CommitBrowserApp(App):
         shas_list.clear_options()
         self.current_shas = []
 
-        for sha, dt in rows:
+        for sha, dt, sim in rows:
             self.current_shas.append(sha)
             dt_str = DETECTION_NAMES.get(dt, str(dt))
-            shas_list.add_option(Option(f"{sha[:10]} [{dt_str}]", id=sha))
+            sim_str = f" | {sim:.2f}" if sim is not None else ""
+            shas_list.add_option(Option(f"{sha[:10]} [{dt_str}{sim_str}]", id=sha))
 
         if self.current_shas:
             shas_list.highlighted = 0
